@@ -38,6 +38,21 @@ const FORBIDDEN_PATH_SEGMENTS = new Set([
   "tmp",
 ]);
 
+const FORBIDDEN_LIFECYCLE_SCRIPTS = Object.freeze([
+  "preinstall",
+  "install",
+  "postinstall",
+  "prepack",
+  "prepare",
+  "postpack",
+  "prepublish",
+  "prepublishOnly",
+  "publish",
+  "postpublish",
+]);
+
+const ALLOWED_EXTENSIONS = new Set([".json", ".md", ".ts"]);
+
 function normalizePackagePath(filePath) {
   return filePath.replaceAll("\\", "/").replace(/^\.\//, "");
 }
@@ -56,7 +71,18 @@ export function assertPackageContents(files) {
 
   const paths = files.map((file) => {
     if (typeof file?.path !== "string") throw new Error("npm pack output contained a file without a string path");
-    return normalizePackagePath(file.path);
+    const normalized = normalizePackagePath(file.path);
+    const segments = normalized.split("/");
+    if (
+      normalized !== file.path
+      || normalized.startsWith("/")
+      || /^[A-Za-z]:\//.test(normalized)
+      || segments.some((segment) => segment === "" || segment === "." || segment === "..")
+    ) throw new Error(`Package contains an unsafe path: ${file.path}`);
+    if (!ALLOWED_EXTENSIONS.has(path.extname(normalized))) throw new Error(`Package contains an unsupported file type: ${normalized}`);
+    if (!Number.isInteger(file.size) || file.size < 0 || file.size > 5 * 1024 * 1024) throw new Error(`Package contains invalid file size metadata: ${normalized}`);
+    if (file.mode !== 0o644) throw new Error(`Package contains an executable or unsafe file mode: ${normalized}`);
+    return normalized;
   });
   const pathSet = new Set(paths);
 
@@ -86,10 +112,10 @@ export function assertPackageMetadata(packageData, packageJson, pathCount) {
   invariant(packageData.id === `${packageJson.name}@${packageJson.version}`, "npm pack id must match name and version");
   invariant(packageData.filename === `${packageJson.name}-${packageJson.version}.tgz`, "tarball filename must match name and version");
   invariant(packageData.entryCount === pathCount, "npm pack entry count must match the audited file list");
-  invariant(Number.isInteger(packageData.size) && packageData.size > 0, "tarball size must be a positive integer");
-  invariant(Number.isInteger(packageData.unpackedSize) && packageData.unpackedSize > 0, "unpacked size must be a positive integer");
+  invariant(Number.isInteger(packageData.size) && packageData.size > 0 && packageData.size <= 5 * 1024 * 1024, "tarball size must be between 1 byte and 5 MiB");
+  invariant(Number.isInteger(packageData.unpackedSize) && packageData.unpackedSize > 0 && packageData.unpackedSize <= 15 * 1024 * 1024, "unpacked size must be between 1 byte and 15 MiB");
   invariant(typeof packageData.shasum === "string" && /^[0-9a-f]{40}$/.test(packageData.shasum), "npm pack must emit a SHA-1 shasum");
-  invariant(typeof packageData.integrity === "string" && packageData.integrity.startsWith("sha512-"), "npm pack must emit SHA-512 integrity");
+  invariant(typeof packageData.integrity === "string" && /^sha512-[A-Za-z0-9+/]+={0,2}$/.test(packageData.integrity), "npm pack must emit SHA-512 integrity");
   invariant(Array.isArray(packageData.bundled) && packageData.bundled.length === 0, "package must not bundle dependencies");
   invariant(packageJson.repository?.url === "git+https://github.com/10ego/pi-footer-display.git", "repository URL must be canonical");
   invariant(packageJson.homepage === "https://github.com/10ego/pi-footer-display#readme", "homepage must be canonical");
@@ -101,11 +127,14 @@ export function assertPackageMetadata(packageData, packageJson, pathCount) {
   invariant(packageJson.engines?.node === ">=22.19.0", "Node engine must match the tested minimum");
   invariant(JSON.stringify(packageJson.files) === JSON.stringify(["src", "ARCHITECTURE.md", "README.md"]), "package files allowlist must be exact");
   invariant(JSON.stringify(packageJson.pi?.extensions) === JSON.stringify(["./src/index.ts"]), "Pi extension entry point must be exact");
+  for (const script of FORBIDDEN_LIFECYCLE_SCRIPTS) {
+    invariant(!Object.hasOwn(packageJson.scripts ?? {}, script), `package lifecycle script is forbidden: ${script}`);
+  }
 }
 
 export function verifyPackageContents(rootDir = process.cwd()) {
   const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-  const result = spawnSync(npmCommand, ["pack", "--dry-run", "--json"], {
+  const result = spawnSync(npmCommand, ["pack", "--dry-run", "--ignore-scripts", "--json"], {
     cwd: rootDir,
     encoding: "utf8",
     shell: false,

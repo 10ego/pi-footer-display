@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing non-draft GitHub release tag to recover (for example v1.2.3)
+        description: Existing non-draft GitHub release tag to recover (for example v1.8.0)
         required: false
         default: ""
         type: string
@@ -31,19 +31,18 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      - name: Create nerv-ops installation token
+      - name: Create repository-scoped nerv-ops token
         id: app-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.NERV_OPS_APP_ID }}
+          client-id: ${{ vars.NERV_OPS_CLIENT_ID }}
           private-key: ${{ secrets.NERV_OPS_PRIVATE_KEY }}
           permission-contents: write
-          permission-issues: write
           permission-pull-requests: write
 
       - name: Run Release Please
         id: release
-        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
@@ -56,6 +55,10 @@ jobs:
           RELEASE_PRS: ${{ steps.release.outputs.prs }}
         run: |
           jq -r '.[].number' <<< "$RELEASE_PRS" | while read -r number; do
+            [[ "$number" =~ ^[1-9][0-9]*$ ]] || {
+              echo "Release Please emitted an invalid pull-request number" >&2
+              exit 1
+            }
             merge_method="$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest.mergeMethod // "NONE"')"
             echo "Release PR #$number auto-merge method: $merge_method"
 
@@ -79,24 +82,20 @@ jobs:
             gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --auto --squash
           done
 
-  prepare:
-    name: Prepare npm package
+  validate:
+    name: Validate exact release source
     needs: release
     if: ${{ always() && vars.RELEASE_AUTOMATION_ENABLED == 'true' && vars.NPM_TRUSTED_PUBLISHING_READY == 'true' && github.ref == 'refs/heads/main' && ((needs.release.result == 'success' && needs.release.outputs.release_created == 'true') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     permissions:
       contents: read
     outputs:
+      commit_sha: ${{ steps.identity.outputs.commit_sha }}
+      dist_tag: ${{ steps.target.outputs.dist_tag }}
       should_publish: ${{ steps.availability.outputs.should_publish }}
       tag: ${{ steps.target.outputs.tag }}
       version: ${{ steps.target.outputs.version }}
-      dist_tag: ${{ steps.target.outputs.dist_tag }}
-      artifact_id: ${{ steps.upload.outputs.artifact-id }}
-      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
-      artifact_name: ${{ steps.package.outputs.artifact_name }}
-      tarball_filename: ${{ steps.package.outputs.tarball_filename }}
-      tarball_sha256: ${{ steps.package.outputs.tarball_sha256 }}
     steps:
       - name: Resolve release target
         id: target
@@ -110,17 +109,17 @@ jobs:
           else
             TARGET_TAG="$RELEASE_TAG"
             RECOVERY=false
-            if [[ -z "$TARGET_TAG" ]]; then
+            [[ -n "$TARGET_TAG" ]] || {
               echo "Release Please did not emit a tag" >&2
               exit 1
-            fi
+            }
           fi
 
-          SEMVER_PATTERN='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
-          if [[ ! "$TARGET_TAG" =~ $SEMVER_PATTERN ]]; then
-            echo "Release tag must be an exact v-prefixed semantic version: $TARGET_TAG" >&2
+          SEMVER_PATTERN='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+          [[ "$TARGET_TAG" =~ $SEMVER_PATTERN ]] || {
+            echo "Release tag must be an exact v-prefixed semantic version without build metadata: $TARGET_TAG" >&2
             exit 1
-          fi
+          }
           VERSION="${TARGET_TAG#v}"
 
           if [[ "$VERSION" == *-* ]]; then
@@ -153,17 +152,43 @@ jobs:
           }
 
       - name: Check out exact release tag
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ steps.target.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Verify tag identity and main ancestry before source execution
+        id: identity
+        env:
+          TARGET_TAG: ${{ steps.target.outputs.tag }}
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          [[ "$TARGET_TAG" == "v$VERSION" ]] || {
+            echo "Tag and version do not match" >&2
+            exit 1
+          }
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          tag_commit="$(git rev-parse "refs/tags/$TARGET_TAG^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          [[ "$tag_commit" == "$head_commit" ]] || {
+            echo "Checked-out commit is not the commit for $TARGET_TAG" >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$head_commit" refs/remotes/origin/main || {
+            echo "Release tag $TARGET_TAG is not in main history" >&2
+            exit 1
+          }
+          [[ "$head_commit" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Release commit is not a full SHA" >&2
+            exit 1
+          }
+          echo "commit_sha=$head_commit" >> "$GITHUB_OUTPUT"
+
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.7.0
-          registry-url: https://registry.npmjs.org
+          node-version: 24.18.0
           cache: npm
 
       - name: Verify bundled npm supports trusted publishing
@@ -171,52 +196,34 @@ jobs:
           npm_version="$(npm --version)"
           NPM_VERSION="$npm_version" node <<'NODE'
           const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(process.env.NPM_VERSION ?? "");
-          if (!match) {
-            console.error(`Could not parse bundled npm version: ${process.env.NPM_VERSION ?? ""}`);
-            process.exit(1);
-          }
+          if (!match) throw new Error(`Could not parse bundled npm version: ${process.env.NPM_VERSION ?? ""}`);
           const actual = match.slice(1).map(Number);
           const minimum = [11, 5, 1];
-          const supported = actual.some((part, index) => part > minimum[index]
-            && actual.slice(0, index).every((value, prior) => value === minimum[prior]))
-            || actual.every((part, index) => part === minimum[index]);
-          if (!supported) {
-            console.error(`Bundled npm ${actual.join(".")} is below required 11.5.1`);
-            process.exit(1);
+          const comparison = actual.findIndex((value, index) => value !== minimum[index]);
+          if (comparison !== -1 && actual[comparison] < minimum[comparison]) {
+            throw new Error(`Bundled npm ${actual.join(".")} is below required 11.5.1`);
           }
-          console.log(`Verified bundled npm ${actual.join(".")} supports trusted publishing.`);
+          console.log(`Verified bundled npm ${actual.join(".")}.`);
           NODE
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
 
-      - name: Run tests
-        run: npm test
-
-      - name: Verify release version metadata
+      - name: Run tests and release audits
         env:
           EXPECTED_VERSION: ${{ steps.target.outputs.version }}
-        run: npm run verify:release-version -- --expected "$EXPECTED_VERSION"
-
-      - name: Inspect npm package
-        run: npm run verify:package
-
-      - name: Verify exact release tag and main ancestry
-        env:
-          TARGET_TAG: ${{ steps.target.outputs.tag }}
-          VERSION: ${{ steps.target.outputs.version }}
         run: |
-          EXPECTED_TAG="v${VERSION}"
-          [[ "$TARGET_TAG" == "$EXPECTED_TAG" ]] || {
-            echo "Expected exact tag $EXPECTED_TAG, received $TARGET_TAG" >&2
-            exit 1
-          }
-          [[ "$(git rev-parse "refs/tags/$TARGET_TAG^{commit}")" == "$(git rev-parse HEAD)" ]] || {
-            echo "Checked-out commit is not the commit for $TARGET_TAG" >&2
-            exit 1
-          }
-          git merge-base --is-ancestor HEAD refs/remotes/origin/main || {
-            echo "Release tag $TARGET_TAG is not on main; refusing to publish an arbitrary commit" >&2
+          npm test
+          npm run verify:release-version -- --expected "$EXPECTED_VERSION"
+          npm run verify:package
+
+      - name: Require tests to leave tracked source unchanged
+        run: |
+          git diff --exit-code
+          untracked="$(git status --short --untracked-files=all)"
+          [[ -z "$untracked" ]] || {
+            printf '%s\n' "$untracked" >&2
+            echo "Release validation left untracked files" >&2
             exit 1
           }
 
@@ -227,174 +234,178 @@ jobs:
           RECOVERY: ${{ steps.target.outputs.recovery }}
           VERSION: ${{ steps.target.outputs.version }}
         run: |
-          PACKAGE_NAME="$(node --input-type=module -e 'import packageJson from "./package.json" with { type: "json" }; process.stdout.write(packageJson.name)')"
-          output_file="$RUNNER_TEMP/npm-view-output.json"
-          error_file="$RUNNER_TEMP/npm-view-error.txt"
-          if npm view "$PACKAGE_NAME@$VERSION" version --json > "$output_file" 2> "$error_file"; then
-            if ! node --input-type=module - "$output_file" "$VERSION" <<'NODE'
+          PACKAGE_NAME=pi-footer-display
+          version_output="$RUNNER_TEMP/npm-version.json"
+          version_error="$RUNNER_TEMP/npm-version-error.txt"
+          if npm view "$PACKAGE_NAME@$VERSION" version --json > "$version_output" 2> "$version_error"; then
+            VERSION_OUTPUT="$version_output" EXPECTED_VERSION="$VERSION" node <<'NODE'
           import fs from "node:fs";
-          const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-          if (payload !== process.argv[3]) process.exit(1);
+          const value = JSON.parse(fs.readFileSync(process.env.VERSION_OUTPUT, "utf8"));
+          if (value !== process.env.EXPECTED_VERSION) throw new Error("npm returned inconsistent version metadata");
           NODE
-            then
-              cat "$output_file" >&2
-              cat "$error_file" >&2
-              echo "npm returned malformed version metadata for $PACKAGE_NAME@$VERSION." >&2
-              exit 1
-            fi
             if [[ "$RECOVERY" == "true" ]]; then
-              echo "$PACKAGE_NAME@$VERSION is already published; recovery has nothing to do."
+              echo "$PACKAGE_NAME@$VERSION is already published; recovery is a no-op."
               echo "should_publish=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "$PACKAGE_NAME@$VERSION is already published; refusing duplicate normal publish." >&2
+            echo "$PACKAGE_NAME@$VERSION is already published; refusing a duplicate normal release." >&2
             exit 1
           fi
-          if ! node --input-type=module - "$output_file" <<'NODE'
+          VERSION_OUTPUT="$version_output" node <<'NODE' || {
           import fs from "node:fs";
-          const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-          if (payload?.error?.code !== "E404") process.exit(1);
+          const value = JSON.parse(fs.readFileSync(process.env.VERSION_OUTPUT, "utf8"));
+          if (value?.error?.code !== "E404") process.exit(1);
           NODE
-          then
-            cat "$output_file" >&2
-            cat "$error_file" >&2
-            echo "Could not determine whether $PACKAGE_NAME@$VERSION exists." >&2
+            cat "$version_output" >&2
+            cat "$version_error" >&2
+            echo "Could not prove that $PACKAGE_NAME@$VERSION is absent." >&2
             exit 1
-          fi
-          echo "$PACKAGE_NAME@$VERSION is absent from npm."
+          }
 
-          dist_tag_output="$RUNNER_TEMP/npm-dist-tag-output.json"
-          dist_tag_error="$RUNNER_TEMP/npm-dist-tag-error.txt"
-          if npm view "$PACKAGE_NAME" "dist-tags.$DIST_TAG" --json > "$dist_tag_output" 2> "$dist_tag_error"; then
-            if ! CURRENT_VERSION="$(node --input-type=module - "$dist_tag_output" <<'NODE'
+          tags_output="$RUNNER_TEMP/npm-dist-tags.json"
+          tags_error="$RUNNER_TEMP/npm-dist-tags-error.txt"
+          if npm view "$PACKAGE_NAME" dist-tags --json > "$tags_output" 2> "$tags_error"; then
+            current_version="$(TAGS_OUTPUT="$tags_output" DIST_TAG="$DIST_TAG" node <<'NODE'
           import fs from "node:fs";
-          const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-          if (typeof payload !== "string" || payload.length === 0) process.exit(1);
-          process.stdout.write(payload);
+          const value = JSON.parse(fs.readFileSync(process.env.TAGS_OUTPUT, "utf8"));
+          if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("npm dist-tags must be an object");
+          const current = value[process.env.DIST_TAG];
+          if (current !== undefined && (typeof current !== "string" || current.length === 0)) throw new Error("selected npm dist-tag is malformed");
+          process.stdout.write(current ?? "");
           NODE
-          )"; then
-              cat "$dist_tag_output" >&2
-              cat "$dist_tag_error" >&2
-              echo "npm returned a malformed $DIST_TAG dist-tag for $PACKAGE_NAME." >&2
-              exit 1
-            fi
-          elif node --input-type=module - "$dist_tag_output" <<'NODE'
+          )"
+          elif TAGS_OUTPUT="$tags_output" node <<'NODE'
           import fs from "node:fs";
-          const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-          if (payload?.error?.code !== "E404") process.exit(1);
+          const value = JSON.parse(fs.readFileSync(process.env.TAGS_OUTPUT, "utf8"));
+          if (value?.error?.code !== "E404") process.exit(1);
           NODE
           then
-            CURRENT_VERSION=""
-            echo "$PACKAGE_NAME is absent from npm; no current $DIST_TAG dist-tag exists."
+            current_version=""
           else
-            cat "$dist_tag_output" >&2
-            cat "$dist_tag_error" >&2
-            echo "Could not determine the current $DIST_TAG dist-tag for $PACKAGE_NAME." >&2
+            cat "$tags_output" >&2
+            cat "$tags_error" >&2
+            echo "Could not read npm dist-tags for $PACKAGE_NAME." >&2
             exit 1
           fi
 
-          if [[ -n "$CURRENT_VERSION" ]]; then
-            if ! comparison="$(node scripts/compare-semver.mjs "$VERSION" "$CURRENT_VERSION")"; then
-              echo "Could not compare $VERSION with current $DIST_TAG version $CURRENT_VERSION." >&2
+          if [[ -n "$current_version" ]]; then
+            comparison="$(node scripts/compare-semver.mjs "$VERSION" "$current_version")"
+            [[ "$comparison" == "1" ]] || {
+              echo "$VERSION would not advance $DIST_TAG from $current_version." >&2
               exit 1
-            fi
-            case "$comparison" in
-              1)
-                echo "$VERSION is newer than current $DIST_TAG version $CURRENT_VERSION."
-                ;;
-              -1)
-                echo "$VERSION is lower than current $DIST_TAG version $CURRENT_VERSION; refusing dist-tag regression." >&2
-                exit 1
-                ;;
-              0)
-                echo "$VERSION equals current $DIST_TAG version $CURRENT_VERSION after the exact-version absence check; refusing inconsistent npm state." >&2
-                exit 1
-                ;;
-              *)
-                echo "Unexpected semantic-version comparison result: $comparison" >&2
-                exit 1
-                ;;
-            esac
+            }
           fi
-
           echo "should_publish=true" >> "$GITHUB_OUTPUT"
 
-      - name: Build and validate release tarball
-        if: ${{ steps.availability.outputs.should_publish == 'true' }}
-        id: package
+  package:
+    name: Package exact release source
+    needs: validate
+    if: ${{ needs.validate.result == 'success' && needs.validate.outputs.should_publish == 'true' && vars.RELEASE_AUTOMATION_ENABLED == 'true' && vars.NPM_TRUSTED_PUBLISHING_READY == 'true' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_name: ${{ steps.pack.outputs.artifact_name }}
+      tarball_filename: ${{ steps.pack.outputs.tarball_filename }}
+      tarball_sha256: ${{ steps.pack.outputs.tarball_sha256 }}
+    steps:
+      - name: Check out exact release tag in fresh runner
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reverify exact release commit
         env:
-          EXPECTED_VERSION: ${{ steps.target.outputs.version }}
+          EXPECTED_COMMIT_SHA: ${{ needs.validate.outputs.commit_sha }}
+          EXPECTED_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_COMMIT_SHA" ]] || {
+            echo "Fresh checkout does not match validated release commit" >&2
+            exit 1
+          }
+          [[ "$(git rev-parse "refs/tags/$EXPECTED_TAG^{commit}")" == "$EXPECTED_COMMIT_SHA" ]] || {
+            echo "Release tag moved after validation" >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$EXPECTED_COMMIT_SHA" refs/remotes/origin/main
+
+      - name: Set up Node.js without dependency cache
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+
+      - name: Build one lifecycle-script-disabled tarball
+        id: pack
+        env:
+          EXPECTED_COMMIT_SHA: ${{ needs.validate.outputs.commit_sha }}
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
         run: |
           output_dir="$(mktemp -d "$RUNNER_TEMP/npm-package.XXXXXX")"
           pack_json="$RUNNER_TEMP/npm-pack.json"
           npm pack --ignore-scripts --json --pack-destination "$output_dir" > "$pack_json"
 
-          validation="$(node --input-type=module - "$pack_json" "$output_dir" "$EXPECTED_VERSION" <<'NODE'
+          validation="$(PACK_JSON="$pack_json" OUTPUT_DIR="$output_dir" EXPECTED_VERSION="$EXPECTED_VERSION" node <<'NODE'
           import fs from "node:fs";
           import path from "node:path";
-          import { assertPackageContents, assertPackageMetadata } from "./scripts/verify-package-contents.mjs";
 
-          const [packJsonPath, outputDir, expectedVersion] = process.argv.slice(2);
-          const payload = JSON.parse(fs.readFileSync(packJsonPath, "utf8"));
-          if (!Array.isArray(payload) || payload.length !== 1) {
-            throw new Error(`Expected npm pack to build exactly one tarball; received ${Array.isArray(payload) ? payload.length : "non-array output"}`);
-          }
-
-          const packageData = payload[0];
-          const packageJson = JSON.parse(fs.readFileSync("package.json", "utf8"));
-          if (packageJson.version !== expectedVersion || packageData.version !== expectedVersion) {
-            throw new Error(`Packed version does not exactly match ${expectedVersion}`);
-          }
-          const paths = assertPackageContents(packageData.files);
-          assertPackageMetadata(packageData, packageJson, paths.length);
-
-          if (path.basename(packageData.filename) !== packageData.filename) {
-            throw new Error(`Unsafe tarball filename: ${packageData.filename}`);
-          }
-          const entries = fs.readdirSync(outputDir, { withFileTypes: true });
-          if (entries.length !== 1 || !entries[0].isFile() || entries[0].name !== packageData.filename) {
-            throw new Error("Isolated package output must contain only the expected tarball");
-          }
-          const tarballPath = path.join(outputDir, packageData.filename);
+          const expectedFiles = ["src", "ARCHITECTURE.md", "README.md"];
+          const requiredPaths = new Set([
+            "package.json", "ARCHITECTURE.md", "README.md", "src/cache.ts", "src/context.ts",
+            "src/extension.ts", "src/format.ts", "src/git.ts", "src/github.ts", "src/index.ts",
+            "src/paths.ts", "src/process.ts", "src/state.ts", "src/types.ts",
+          ]);
+          const expectedExtensions = ["./src/index.ts"];
+          const expectedPeers = {"@earendil-works/pi-coding-agent": "*"};
+          const forbiddenScripts = ["preinstall", "install", "postinstall", "prepack", "prepare", "postpack", "prepublish", "prepublishOnly", "publish", "postpublish"];
+          const payload = JSON.parse(fs.readFileSync(process.env.PACK_JSON, "utf8"));
+          if (!Array.isArray(payload) || payload.length !== 1) throw new Error("npm pack must create exactly one package");
+          const data = payload[0];
+          const manifest = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          if (manifest.name !== "pi-footer-display" || data.name !== manifest.name) throw new Error("package name mismatch");
+          if (manifest.version !== process.env.EXPECTED_VERSION || data.version !== manifest.version) throw new Error("package version mismatch");
+          if (JSON.stringify(manifest.files) !== JSON.stringify(expectedFiles)) throw new Error("package files policy changed");
+          if (JSON.stringify(manifest.pi?.extensions) !== JSON.stringify(expectedExtensions) || JSON.stringify(manifest.peerDependencies) !== JSON.stringify(expectedPeers)) throw new Error("Pi runtime metadata changed");
+          if (manifest.engines?.node !== ">=22.19.0" || manifest.type !== "module" || manifest.license !== "MIT") throw new Error("runtime compatibility policy changed");
+          if (manifest.repository?.url !== "git+https://github.com/10ego/pi-footer-display.git" || manifest.homepage !== "https://github.com/10ego/pi-footer-display#readme" || manifest.bugs?.url !== "https://github.com/10ego/pi-footer-display/issues") throw new Error("repository metadata changed");
+          if (manifest.publishConfig?.access !== "public" || manifest.publishConfig?.registry !== "https://registry.npmjs.org/" || manifest.publishConfig?.provenance !== true || "private" in manifest) throw new Error("unsafe publish configuration");
+          for (const script of forbiddenScripts) if (Object.hasOwn(manifest.scripts ?? {}, script)) throw new Error(`forbidden lifecycle script: ${script}`);
+          if (!Array.isArray(data.files) || data.files.length < 1 || data.files.length > 100) throw new Error("invalid package file count");
+          const allowed = (name) => name === "package.json" || name === "ARCHITECTURE.md" || name === "README.md" || name.startsWith("src/");
+          const paths = data.files.map((file) => {
+            if (typeof file?.path !== "string" || file.path.includes("\\") || path.posix.normalize(file.path) !== file.path || file.path.startsWith("/") || file.path.split("/").some((part) => ["", ".", ".."].includes(part))) throw new Error(`unsafe package path: ${file?.path}`);
+            if (!allowed(file.path) || ![".json", ".md", ".ts"].includes(path.posix.extname(file.path))) throw new Error(`unexpected package path: ${file.path}`);
+            if (file.mode !== 0o644 || !Number.isInteger(file.size) || file.size < 0) throw new Error(`unsafe package file metadata: ${file.path}`);
+            return file.path;
+          });
+          if (new Set(paths).size !== paths.length || [...requiredPaths].some((required) => !paths.includes(required))) throw new Error("missing or duplicate package paths");
+          if (data.entryCount !== paths.length || !Array.isArray(data.bundled) || data.bundled.length !== 0) throw new Error("unsafe package entries");
+          if (!Number.isInteger(data.size) || data.size < 1 || data.size > 5 * 1024 * 1024) throw new Error("unsafe tarball size");
+          if (!Number.isInteger(data.unpackedSize) || data.unpackedSize < 1 || data.unpackedSize > 15 * 1024 * 1024) throw new Error("unsafe unpacked size");
+          const expectedFilename = `pi-footer-display-${process.env.EXPECTED_VERSION}.tgz`;
+          if (data.filename !== expectedFilename || path.basename(data.filename) !== data.filename) throw new Error("unsafe tarball filename");
+          const entries = fs.readdirSync(process.env.OUTPUT_DIR, { withFileTypes: true });
+          if (entries.length !== 1 || !entries[0].isFile() || entries[0].name !== expectedFilename) throw new Error("package output must contain exactly one tarball");
+          const tarballPath = path.join(process.env.OUTPUT_DIR, expectedFilename);
           const stat = fs.lstatSync(tarballPath);
-          if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1) {
-            throw new Error("Packed tarball must be one non-empty regular file");
-          }
-          if (path.dirname(fs.realpathSync(tarballPath)) !== fs.realpathSync(outputDir)) {
-            throw new Error("Packed tarball escaped the isolated output directory");
-          }
-
-          process.stdout.write(JSON.stringify({
-            filename: packageData.filename,
-            name: packageData.name,
-            tarballPath,
-          }));
+          if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || path.dirname(fs.realpathSync(tarballPath)) !== fs.realpathSync(process.env.OUTPUT_DIR)) throw new Error("unsafe tarball path");
+          process.stdout.write(JSON.stringify({ filename: expectedFilename, tarballPath }));
           NODE
           )"
 
-          package_name="$(jq -er '.name' <<< "$validation")"
           tarball_filename="$(jq -er '.filename' <<< "$validation")"
           tarball_path="$(jq -er '.tarballPath' <<< "$validation")"
-          [[ "$package_name" == "pi-footer-display" ]] || {
-            echo "Unexpected npm package name: $package_name" >&2
-            exit 1
-          }
-          [[ "$tarball_filename" == "$package_name-$EXPECTED_VERSION.tgz" ]] || {
-            echo "Unexpected npm tarball filename: $tarball_filename" >&2
-            exit 1
-          }
-          [[ -f "$tarball_path" && ! -L "$tarball_path" ]] || {
-            echo "Expected one regular tarball at $tarball_path" >&2
-            exit 1
-          }
-
           tarball_sha256="$(sha256sum "$tarball_path" | awk '{print $1}')"
           [[ "$tarball_sha256" =~ ^[0-9a-f]{64}$ ]] || {
-            echo "Could not compute the tarball SHA-256" >&2
+            echo "Could not compute tarball SHA-256" >&2
             exit 1
           }
-          artifact_name="npm-package-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${EXPECTED_VERSION}"
-
+          artifact_name="npm-package-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${EXPECTED_VERSION}-${EXPECTED_COMMIT_SHA}"
           {
             echo "artifact_name=$artifact_name"
             echo "tarball_filename=$tarball_filename"
@@ -402,19 +413,17 @@ jobs:
             echo "tarball_sha256=$tarball_sha256"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Upload release tarball
-        if: ${{ steps.availability.outputs.should_publish == 'true' }}
+      - name: Upload exact release tarball
         id: upload
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ steps.package.outputs.artifact_name }}
-          path: ${{ steps.package.outputs.tarball_path }}
+          name: ${{ steps.pack.outputs.artifact_name }}
+          path: ${{ steps.pack.outputs.tarball_path }}
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
 
-      - name: Validate uploaded artifact outputs
-        if: ${{ steps.availability.outputs.should_publish == 'true' }}
+      - name: Validate artifact identity outputs
         env:
           ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
           ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
@@ -424,14 +433,16 @@ jobs:
             exit 1
           }
           [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]] || {
-            echo "upload-artifact did not return a valid SHA-256 artifact digest" >&2
+            echo "upload-artifact did not return a valid digest" >&2
             exit 1
           }
 
   publish:
     name: Publish verified tarball to npm
-    needs: prepare
-    if: ${{ needs.prepare.result == 'success' && needs.prepare.outputs.should_publish == 'true' && vars.RELEASE_AUTOMATION_ENABLED == 'true' && vars.NPM_TRUSTED_PUBLISHING_READY == 'true' && github.ref == 'refs/heads/main' }}
+    needs:
+      - validate
+      - package
+    if: ${{ needs.package.result == 'success' && vars.RELEASE_AUTOMATION_ENABLED == 'true' && vars.NPM_TRUSTED_PUBLISHING_READY == 'true' && github.ref == 'refs/heads/main' }}
     environment: npm-publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -439,10 +450,10 @@ jobs:
       actions: read
       id-token: write
     steps:
-      - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - name: Set up Node.js for trusted publishing
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.7.0
+          node-version: 24.18.0
           registry-url: https://registry.npmjs.org
 
       - name: Verify bundled npm supports trusted publishing
@@ -450,254 +461,257 @@ jobs:
           npm_version="$(npm --version)"
           NPM_VERSION="$npm_version" node <<'NODE'
           const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(process.env.NPM_VERSION ?? "");
-          if (!match) {
-            console.error(`Could not parse bundled npm version: ${process.env.NPM_VERSION ?? ""}`);
-            process.exit(1);
-          }
+          if (!match) throw new Error(`Could not parse bundled npm version: ${process.env.NPM_VERSION ?? ""}`);
           const actual = match.slice(1).map(Number);
           const minimum = [11, 5, 1];
-          const supported = actual.some((part, index) => part > minimum[index]
-            && actual.slice(0, index).every((value, prior) => value === minimum[prior]))
-            || actual.every((part, index) => part === minimum[index]);
-          if (!supported) {
-            console.error(`Bundled npm ${actual.join(".")} is below required 11.5.1`);
-            process.exit(1);
-          }
-          console.log(`Verified bundled npm ${actual.join(".")} supports trusted publishing.`);
+          const comparison = actual.findIndex((value, index) => value !== minimum[index]);
+          if (comparison !== -1 && actual[comparison] < minimum[comparison]) throw new Error(`Bundled npm ${actual.join(".")} is below required 11.5.1`);
+          console.log(`Verified bundled npm ${actual.join(".")}.`);
           NODE
 
-      - name: Validate prepared package metadata
+      - name: Validate prepared artifact identity
         env:
-          ARTIFACT_ID: ${{ needs.prepare.outputs.artifact_id }}
-          ARTIFACT_NAME: ${{ needs.prepare.outputs.artifact_name }}
-          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
-          EXPECTED_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.artifact_digest }}
-          EXPECTED_SHA256: ${{ needs.prepare.outputs.tarball_sha256 }}
-          EXPECTED_TAG: ${{ needs.prepare.outputs.tag }}
-          EXPECTED_TARBALL_FILENAME: ${{ needs.prepare.outputs.tarball_filename }}
-          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+          ARTIFACT_DIGEST: ${{ needs.package.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.package.outputs.artifact_id }}
+          ARTIFACT_NAME: ${{ needs.package.outputs.artifact_name }}
+          COMMIT_SHA: ${{ needs.validate.outputs.commit_sha }}
+          DIST_TAG: ${{ needs.validate.outputs.dist_tag }}
+          TARBALL_FILENAME: ${{ needs.package.outputs.tarball_filename }}
+          TARBALL_SHA256: ${{ needs.package.outputs.tarball_sha256 }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          SEMVER_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
-          [[ "$EXPECTED_VERSION" =~ $SEMVER_PATTERN ]] || {
-            echo "Prepared version is not an exact semantic version: $EXPECTED_VERSION" >&2
-            exit 1
-          }
-          [[ "$EXPECTED_TAG" == "v$EXPECTED_VERSION" ]] || {
-            echo "Prepared tag does not exactly match version $EXPECTED_VERSION" >&2
-            exit 1
-          }
-          [[ "$EXPECTED_TARBALL_FILENAME" == "pi-footer-display-$EXPECTED_VERSION.tgz" ]] || {
-            echo "Unexpected prepared tarball filename: $EXPECTED_TARBALL_FILENAME" >&2
-            exit 1
-          }
-          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || {
-            echo "Prepared artifact ID is invalid" >&2
-            exit 1
-          }
-          [[ "$ARTIFACT_NAME" =~ ^npm-package-[0-9]+-[0-9]+-[0-9A-Za-z.+-]+$ ]] || {
-            echo "Unexpected prepared artifact name: $ARTIFACT_NAME" >&2
-            exit 1
-          }
-          [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
-            echo "Prepared tarball SHA-256 is invalid" >&2
-            exit 1
-          }
-          [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]] || {
-            echo "Prepared server artifact digest is invalid" >&2
-            exit 1
-          }
-
+          SEMVER_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+          [[ "$VERSION" =~ $SEMVER_PATTERN && "$TAG" == "v$VERSION" ]] || exit 1
+          [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ && "$TARBALL_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 1
+          [[ "$TARBALL_FILENAME" == "pi-footer-display-$VERSION.tgz" ]] || exit 1
+          [[ "$ARTIFACT_NAME" == "npm-package-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${VERSION}-${COMMIT_SHA}" ]] || exit 1
           case "$DIST_TAG" in
-            latest)
-              [[ "$EXPECTED_VERSION" != *-* ]] || {
-                echo "Prerelease version cannot use the latest dist-tag" >&2
-                exit 1
-              }
-              ;;
-            next)
-              [[ "$EXPECTED_VERSION" == *-* ]] || {
-                echo "Stable version cannot use the next dist-tag" >&2
-                exit 1
-              }
-              ;;
-            *)
-              echo "Unexpected npm dist-tag: $DIST_TAG" >&2
-              exit 1
-              ;;
+            latest) [[ "$VERSION" != *-* ]] || exit 1 ;;
+            next) [[ "$VERSION" == *-* ]] || exit 1 ;;
+            *) exit 1 ;;
           esac
 
-      - name: Verify GitHub Actions artifact metadata
+      - name: Verify GitHub artifact server metadata
         env:
-          ARTIFACT_ID: ${{ needs.prepare.outputs.artifact_id }}
-          ARTIFACT_NAME: ${{ needs.prepare.outputs.artifact_name }}
-          EXPECTED_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.artifact_digest }}
+          ARTIFACT_DIGEST: ${{ needs.package.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.package.outputs.artifact_id }}
+          ARTIFACT_NAME: ${{ needs.package.outputs.artifact_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          metadata_file="$RUNNER_TEMP/artifact-metadata.json"
-          gh api \
-            --method GET \
+          metadata="$RUNNER_TEMP/artifact-metadata.json"
+          gh api --method GET \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
-            "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" > "$metadata_file"
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" > "$metadata"
+          metadata_id="$(jq -er 'if (.id | type) == "number" then (.id | tostring) else error("invalid id") end' "$metadata")"
+          metadata_name="$(jq -er 'if (.name | type) == "string" then .name else error("invalid name") end' "$metadata")"
+          metadata_expired="$(jq -er 'if (.expired | type) == "boolean" then (.expired | tostring) else error("invalid expiration") end' "$metadata")"
+          metadata_digest="$(jq -er 'if (.digest | type) == "string" then .digest else error("invalid digest") end' "$metadata")"
+          workflow_run_id="$(jq -er 'if (.workflow_run.id | type) == "number" then (.workflow_run.id | tostring) else error("invalid run id") end' "$metadata")"
+          [[ "$metadata_id" == "$ARTIFACT_ID" ]] || exit 1
+          [[ "$metadata_name" == "$ARTIFACT_NAME" ]] || exit 1
+          [[ "$metadata_expired" == "false" ]] || exit 1
+          [[ "$metadata_digest" == "sha256:$ARTIFACT_DIGEST" ]] || exit 1
+          [[ "$workflow_run_id" == "$GITHUB_RUN_ID" ]] || exit 1
 
-          metadata_id="$(jq -er 'if (.id | type) == "number" then (.id | tostring) else error("invalid artifact id") end' "$metadata_file")"
-          metadata_name="$(jq -er 'if (.name | type) == "string" then .name else error("invalid artifact name") end' "$metadata_file")"
-          metadata_expired="$(jq -er 'if (.expired | type) == "boolean" then (.expired | tostring) else error("invalid artifact expiration status") end' "$metadata_file")"
-          metadata_digest="$(jq -er 'if (.digest | type) == "string" then .digest else error("invalid artifact digest") end' "$metadata_file")"
-          workflow_run_id="$(jq -er '
-            if (.workflow_run.id | type) == "number" then
-              (.workflow_run.id | tostring)
-            else
-              error("invalid artifact workflow run id")
-            end
-          ' "$metadata_file")"
-
-          [[ "$metadata_id" == "$ARTIFACT_ID" ]] || {
-            echo "Artifact metadata ID does not match $ARTIFACT_ID" >&2
-            exit 1
-          }
-          [[ "$metadata_name" == "$ARTIFACT_NAME" ]] || {
-            echo "Artifact metadata name does not match $ARTIFACT_NAME" >&2
-            exit 1
-          }
-          [[ "$metadata_expired" == "false" ]] || {
-            echo "Artifact $ARTIFACT_ID is expired" >&2
-            exit 1
-          }
-          [[ "$metadata_digest" == "sha256:$EXPECTED_ARTIFACT_DIGEST" ]] || {
-            echo "Artifact metadata digest does not match the upload digest" >&2
-            exit 1
-          }
-          [[ "$workflow_run_id" == "$GITHUB_RUN_ID" ]] || {
-            echo "Artifact $ARTIFACT_ID belongs to workflow run $workflow_run_id, not $GITHUB_RUN_ID" >&2
-            exit 1
-          }
-
-      - name: Download exact release tarball artifact
+      - name: Download exact current-run artifact
         id: download
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
-          github-token: ${{ github.token }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/npm-package-download
-          repository: ${{ github.repository }}
-          run-id: ${{ github.run_id }}
+        env:
+          ARTIFACT_DIGEST: ${{ needs.package.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.package.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+          TARBALL_FILENAME: ${{ needs.package.outputs.tarball_filename }}
+        run: |
+          archive="$RUNNER_TEMP/release-artifact.zip"
+          listing="$RUNNER_TEMP/release-artifact-entries.txt"
+          download_dir="$RUNNER_TEMP/npm-package-download"
+          for path in "$archive" "$listing" "$download_dir"; do
+            [[ ! -e "$path" && ! -L "$path" ]] || exit 1
+          done
+          mkdir -- "$download_dir"
 
-      - name: Verify downloaded release tarball
+          gh api --method GET \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$archive"
+          [[ -f "$archive" && ! -L "$archive" ]] || exit 1
+          [[ "$(sha256sum "$archive" | awk '{print $1}')" == "$ARTIFACT_DIGEST" ]] || exit 1
+
+          unzip -Z1 "$archive" > "$listing"
+          mapfile -t entries < "$listing"
+          (( ${#entries[@]} == 1 )) || exit 1
+          [[ "${entries[0]}" == "$TARBALL_FILENAME" ]] || exit 1
+
+          tarball_path="$download_dir/$TARBALL_FILENAME"
+          unzip -p "$archive" "$TARBALL_FILENAME" > "$tarball_path"
+          [[ -s "$tarball_path" && ! -L "$tarball_path" ]] || exit 1
+          echo "download_path=$download_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Verify downloaded package without repository code
         id: verify
         env:
-          ACTION_DOWNLOAD_PATH: ${{ steps.download.outputs.download-path }}
           DOWNLOAD_DIR: ${{ runner.temp }}/npm-package-download
-          EXPECTED_PACKAGE_NAME: pi-footer-display
-          EXPECTED_SHA256: ${{ needs.prepare.outputs.tarball_sha256 }}
-          EXPECTED_TARBALL_FILENAME: ${{ needs.prepare.outputs.tarball_filename }}
-          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+          DOWNLOAD_STEP_PATH: ${{ steps.download.outputs.download_path }}
+          EXPECTED_SHA256: ${{ needs.package.outputs.tarball_sha256 }}
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          [[ -d "$DOWNLOAD_DIR" ]] || {
-            echo "Artifact download directory does not exist" >&2
-            exit 1
-          }
-          [[ "$(realpath "$ACTION_DOWNLOAD_PATH")" == "$(realpath "$DOWNLOAD_DIR")" ]] || {
-            echo "download-artifact returned an unexpected download path" >&2
-            exit 1
-          }
-
+          [[ -d "$DOWNLOAD_DIR" && "$(realpath "$DOWNLOAD_STEP_PATH")" == "$(realpath "$DOWNLOAD_DIR")" ]] || exit 1
           mapfile -d '' entries < <(find "$DOWNLOAD_DIR" -mindepth 1 -maxdepth 1 -print0)
-          (( ${#entries[@]} == 1 )) || {
-            echo "Expected exactly one downloaded artifact file; found ${#entries[@]} entries" >&2
-            exit 1
-          }
+          (( ${#entries[@]} == 1 )) || exit 1
           tarball_path="${entries[0]}"
-          [[ -f "$tarball_path" && ! -L "$tarball_path" ]] || {
-            echo "Downloaded artifact entry is not one regular file" >&2
-            exit 1
-          }
-          [[ "$(basename "$tarball_path")" == "$EXPECTED_TARBALL_FILENAME" ]] || {
-            echo "Downloaded tarball filename does not match $EXPECTED_TARBALL_FILENAME" >&2
-            exit 1
-          }
+          [[ -f "$tarball_path" && ! -L "$tarball_path" ]] || exit 1
+          [[ "$(basename "$tarball_path")" == "pi-footer-display-$EXPECTED_VERSION.tgz" ]] || exit 1
+          [[ "$(sha256sum "$tarball_path" | awk '{print $1}')" == "$EXPECTED_SHA256" ]] || exit 1
 
-          actual_sha256="$(sha256sum "$tarball_path" | awk '{print $1}')"
-          [[ "$actual_sha256" == "$EXPECTED_SHA256" ]] || {
-            echo "Downloaded tarball SHA-256 does not match the prepared package" >&2
-            exit 1
-          }
-          echo "Verified tarball SHA-256: $actual_sha256"
-
-          python3 - "$tarball_path" "$EXPECTED_PACKAGE_NAME" "$EXPECTED_VERSION" <<'PYTHON'
+          python3 - "$tarball_path" "$EXPECTED_VERSION" <<'PYTHON'
           import json
           from pathlib import PurePosixPath
           import sys
           import tarfile
 
-          tarball_path, expected_name, expected_version = sys.argv[1:]
-          seen = set()
-          package_json_member = None
+          tarball_path, expected_version = sys.argv[1:]
+          expected_files = ["src", "ARCHITECTURE.md", "README.md"]
+          forbidden_scripts = {"preinstall", "install", "postinstall", "prepack", "prepare", "postpack", "prepublish", "prepublishOnly", "publish", "postpublish"}
+          required_paths = {
+              "package.json", "ARCHITECTURE.md", "README.md", "src/cache.ts", "src/context.ts",
+              "src/extension.ts", "src/format.ts", "src/git.ts", "src/github.ts", "src/index.ts",
+              "src/paths.ts", "src/process.ts", "src/state.ts", "src/types.ts",
+          }
+          expected_extensions = ["./src/index.ts"]
+          expected_peers = {"@earendil-works/pi-coding-agent": "*"}
 
+          def allowed(path):
+              return path in {"package.json", "ARCHITECTURE.md", "README.md"} or path.startswith("src/")
+
+          seen = set()
+          manifest_member = None
+          total_size = 0
           with tarfile.open(tarball_path, mode="r:gz") as archive:
               members = archive.getmembers()
-              if not members:
-                  raise SystemExit("Release tarball is empty")
-
+              if not 1 <= len(members) <= 100:
+                  raise SystemExit("Invalid tar member count")
               for member in members:
                   name = member.name
                   normalized = PurePosixPath(name)
                   parts = normalized.parts
-                  if (
-                      not name
-                      or "\\" in name
-                      or normalized.is_absolute()
-                      or normalized.as_posix() != name
-                      or len(parts) < 2
-                      or parts[0] != "package"
-                      or any(part in ("", ".", "..") for part in parts)
-                  ):
-                      raise SystemExit(f"Unsafe tar member path: {name!r}")
-                  if name in seen:
-                      raise SystemExit(f"Duplicate tar member path: {name!r}")
-                  seen.add(name)
-                  if member.issym() or member.islnk() or not (member.isfile() or member.isdir()):
-                      raise SystemExit(f"Unsupported tar member type: {name!r}")
+                  if not name or "\\" in name or normalized.is_absolute() or normalized.as_posix() != name or len(parts) < 2 or parts[0] != "package" or any(part in ("", ".", "..") for part in parts):
+                      raise SystemExit(f"Unsafe tar path: {name!r}")
+                  relative = "/".join(parts[1:])
+                  if relative in seen or not allowed(relative) or normalized.suffix not in (".json", ".md", ".ts"):
+                      raise SystemExit(f"Unexpected tar path: {name!r}")
+                  if not member.isfile() or member.mode != 0o644 or member.size < 0 or member.size > 5 * 1024 * 1024:
+                      raise SystemExit(f"Unsafe tar member: {name!r}")
+                  seen.add(relative)
+                  total_size += member.size
                   if name == "package/package.json":
-                      if not member.isfile() or package_json_member is not None:
-                          raise SystemExit("Tarball must contain one regular package/package.json")
-                      package_json_member = member
+                      manifest_member = member
+              if total_size > 15 * 1024 * 1024 or not required_paths.issubset(seen) or manifest_member is None or manifest_member.size > 1_000_000:
+                  raise SystemExit("Package contents do not satisfy release policy")
+              manifest_file = archive.extractfile(manifest_member)
+              if manifest_file is None:
+                  raise SystemExit("Could not read package manifest")
+              manifest = json.load(manifest_file)
 
-              if package_json_member is None:
-                  raise SystemExit("Tarball does not contain package/package.json")
-              if package_json_member.size > 1_000_000:
-                  raise SystemExit("Tarball package.json is unexpectedly large")
-              package_file = archive.extractfile(package_json_member)
-              if package_file is None:
-                  raise SystemExit("Could not read package/package.json")
-              package_json = json.load(package_file)
-
-          if package_json.get("name") != expected_name:
-              raise SystemExit("Tarball package name does not match the prepared package")
-          if package_json.get("version") != expected_version:
-              raise SystemExit("Tarball package version does not match the prepared version")
-          print(f"Verified {len(seen)} safe tar members and {expected_name}@{expected_version}.")
+          if manifest.get("name") != "pi-footer-display" or manifest.get("version") != expected_version:
+              raise SystemExit("Package identity mismatch")
+          if manifest.get("files") != expected_files:
+              raise SystemExit("Package files policy mismatch")
+          pi_config = manifest.get("pi", {})
+          if pi_config.get("extensions") != expected_extensions or manifest.get("peerDependencies") != expected_peers:
+              raise SystemExit("Pi runtime metadata does not match release policy")
+          if manifest.get("engines", {}).get("node") != ">=22.19.0" or manifest.get("type") != "module" or manifest.get("license") != "MIT":
+              raise SystemExit("Runtime compatibility policy mismatch")
+          if manifest.get("repository", {}).get("url") != "git+https://github.com/10ego/pi-footer-display.git" or manifest.get("homepage") != "https://github.com/10ego/pi-footer-display#readme" or manifest.get("bugs", {}).get("url") != "https://github.com/10ego/pi-footer-display/issues":
+              raise SystemExit("Package repository metadata mismatch")
+          if "private" in manifest:
+              raise SystemExit("Package must not declare private")
+          publish_config = manifest.get("publishConfig", {})
+          if publish_config != {"access": "public", "registry": "https://registry.npmjs.org/", "provenance": True}:
+              raise SystemExit("Unsafe publish configuration")
+          if forbidden_scripts.intersection(manifest.get("scripts", {})):
+              raise SystemExit("Package contains a forbidden lifecycle script")
+          print(f"Verified {len(seen)} package files for pi-footer-display@{expected_version}.")
           PYTHON
 
           echo "tarball_path=$tarball_path" >> "$GITHUB_OUTPUT"
 
-      - name: Publish exact tarball to npm
+      - name: Recheck npm state and publish exact tarball
         env:
-          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
-          EXPECTED_SHA256: ${{ needs.prepare.outputs.tarball_sha256 }}
+          DIST_TAG: ${{ needs.validate.outputs.dist_tag }}
           TARBALL_PATH: ${{ steps.verify.outputs.tarball_path }}
+          TARBALL_SHA256: ${{ needs.package.outputs.tarball_sha256 }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          case "$DIST_TAG" in
-            latest|next) ;;
-            *) echo "Unexpected npm dist-tag: $DIST_TAG" >&2; exit 1 ;;
-          esac
-          [[ -f "$TARBALL_PATH" && ! -L "$TARBALL_PATH" ]] || {
-            echo "Verified tarball is no longer one regular file" >&2
+          PACKAGE_NAME=pi-footer-display
+          [[ -f "$TARBALL_PATH" && ! -L "$TARBALL_PATH" ]] || exit 1
+          [[ "$(sha256sum "$TARBALL_PATH" | awk '{print $1}')" == "$TARBALL_SHA256" ]] || exit 1
+
+          version_output="$RUNNER_TEMP/final-npm-version.json"
+          if npm view "$PACKAGE_NAME@$VERSION" version --json > "$version_output" 2> "$RUNNER_TEMP/final-npm-version-error.txt"; then
+            echo "$PACKAGE_NAME@$VERSION appeared after preparation; refusing publication." >&2
             exit 1
-          }
-          [[ "$(sha256sum "$TARBALL_PATH" | awk '{print $1}')" == "$EXPECTED_SHA256" ]] || {
-            echo "Verified tarball changed before publication" >&2
+          fi
+          VERSION_OUTPUT="$version_output" node <<'NODE'
+          import fs from "node:fs";
+          const value = JSON.parse(fs.readFileSync(process.env.VERSION_OUTPUT, "utf8"));
+          if (value?.error?.code !== "E404") throw new Error("Exact package absence was not proven");
+          NODE
+
+          tags_output="$RUNNER_TEMP/final-npm-dist-tags.json"
+          if npm view "$PACKAGE_NAME" dist-tags --json > "$tags_output" 2> "$RUNNER_TEMP/final-npm-dist-tags-error.txt"; then
+            current_version="$(TAGS_OUTPUT="$tags_output" DIST_TAG="$DIST_TAG" node <<'NODE'
+          import fs from "node:fs";
+          const tags = JSON.parse(fs.readFileSync(process.env.TAGS_OUTPUT, "utf8"));
+          if (!tags || typeof tags !== "object" || Array.isArray(tags)) throw new Error("npm dist-tags must be an object");
+          const current = tags[process.env.DIST_TAG];
+          if (current !== undefined && (typeof current !== "string" || current.length === 0)) throw new Error("selected dist-tag is malformed");
+          process.stdout.write(current ?? "");
+          NODE
+          )"
+          elif TAGS_OUTPUT="$tags_output" node <<'NODE'
+          import fs from "node:fs";
+          const value = JSON.parse(fs.readFileSync(process.env.TAGS_OUTPUT, "utf8"));
+          if (value?.error?.code !== "E404") process.exit(1);
+          NODE
+          then
+            current_version=""
+          else
+            echo "Could not recheck npm dist-tags" >&2
             exit 1
-          }
+          fi
+
+          if [[ -n "$current_version" ]]; then
+            comparison="$(LEFT_VERSION="$VERSION" RIGHT_VERSION="$current_version" node <<'NODE'
+          const pattern = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?$/;
+          const parse = (value) => {
+            const match = pattern.exec(value);
+            if (!match) throw new Error(`Invalid semantic version: ${value}`);
+            return { core: match.slice(1, 4).map(BigInt), pre: match[4]?.split(".") ?? null };
+          };
+          const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+          const compare = (left, right) => {
+            const a = parse(left), b = parse(right);
+            for (let i = 0; i < 3; i += 1) { const value = cmp(a.core[i], b.core[i]); if (value) return value; }
+            if (a.pre === null || b.pre === null) return a.pre === b.pre ? 0 : a.pre === null ? 1 : -1;
+            for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i += 1) {
+              if (a.pre[i] === undefined) return -1;
+              if (b.pre[i] === undefined) return 1;
+              const an = /^[0-9]+$/.test(a.pre[i]), bn = /^[0-9]+$/.test(b.pre[i]);
+              const value = an && bn ? cmp(BigInt(a.pre[i]), BigInt(b.pre[i])) : an !== bn ? (an ? -1 : 1) : cmp(a.pre[i], b.pre[i]);
+              if (value) return value;
+            }
+            return 0;
+          };
+          process.stdout.write(String(compare(process.env.LEFT_VERSION, process.env.RIGHT_VERSION)));
+          NODE
+          )"
+            [[ "$comparison" == "1" ]] || {
+              echo "$VERSION would regress $DIST_TAG from $current_version." >&2
+              exit 1
+            }
+          fi
+
           npm publish "$TARBALL_PATH" --access public --provenance --tag "$DIST_TAG" --ignore-scripts
