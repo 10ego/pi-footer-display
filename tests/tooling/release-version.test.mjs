@@ -34,7 +34,8 @@ describe("root release-version invariant", () => {
   test("accepts matching npm, lockfile, and Release Please versions", () => {
     assert.equal(verifyRootReleaseVersion(writeVersionFiles()), "1.2.3");
     assert.equal(verifyRootReleaseVersion(writeVersionFiles(), "1.2.3"), "1.2.3");
-    assert.equal(verifyRootReleaseVersion(process.cwd()), "0.1.0");
+    const currentVersion = JSON.parse(fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8")).version;
+    assert.equal(verifyRootReleaseVersion(process.cwd()), currentVersion);
   });
 
   const mismatchCases = [

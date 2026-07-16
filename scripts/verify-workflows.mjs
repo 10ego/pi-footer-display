@@ -6,7 +6,7 @@ const ACTION_PINS = Object.freeze({
   "actions/checkout": "34e114876b0b11c390a56381ad16ebd13914f8d5",
   "actions/setup-node": "49933ea5288caeca8642d1e84afbd3f7d6820020",
   "actions/create-github-app-token": "fee1f7d63c2ff003460e3d139729b119787bc349",
-  "googleapis/release-please-action": "8b8fd2cc23b2e18957157a9d923d75aa0c6f6ad5",
+  "googleapis/release-please-action": "5c625bfb5d1ff62eadeeb3772007f7f66fdcf071",
 });
 
 const RELEASE_GATE = "if: ${{ vars.RELEASE_AUTOMATION_ENABLED == 'true' && vars.NPM_TRUSTED_PUBLISHING_READY == 'true' && (github.event_name == 'push' || inputs.tag == '') }}";
@@ -57,6 +57,12 @@ export function verifyWorkflowSources({ pullRequest, release, packageJson }) {
   includes(pullRequest, "ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757", "actionlint archive must have a pinned checksum");
   includes(pullRequest, '"$RUNNER_TEMP/actionlint"', "pull-request workflow must run actionlint");
 
+  const releaseEventBlock = release.match(/^on:\n([\s\S]*?)(?=^\S)/m)?.[1] ?? "";
+  const releaseEvents = [...releaseEventBlock.matchAll(/^  ([a-z_]+):/gm)].map((match) => match[1]);
+  invariant(
+    JSON.stringify(releaseEvents) === JSON.stringify(["push", "workflow_dispatch"]),
+    "release workflow must run only on pushes and manual dispatches, never pull requests",
+  );
   includes(release, "push:\n    branches:\n      - main", "release workflow must run on pushes to main");
   includes(release, "workflow_dispatch:\n    inputs:\n      tag:", "release workflow must accept an optional recovery tag");
   includes(release, "required: false\n        default: \"\"", "recovery tag must default to empty");
@@ -70,6 +76,17 @@ export function verifyWorkflowSources({ pullRequest, release, packageJson }) {
 
   includes(release, "app-id: ${{ vars.NERV_OPS_APP_ID }}", "nerv-ops app id is required");
   includes(release, "private-key: ${{ secrets.NERV_OPS_PRIVATE_KEY }}", "nerv-ops private key is required");
+  const releaseTokenStep = release.match(/      - name: Create nerv-ops installation token\n[\s\S]*?(?=\n      - name:)/)?.[0] ?? "";
+  const recoveryTokenStep = release.match(/      - name: Create nerv-ops installation token for recovery verification\n[\s\S]*?(?=\n      - name:)/)?.[0] ?? "";
+  const tokenPermissions = (step) => [...step.matchAll(/^\s+permission-([^:]+): ([^\s]+)$/gm)].map((match) => `${match[1]}:${match[2]}`);
+  invariant(
+    JSON.stringify(tokenPermissions(releaseTokenStep)) === JSON.stringify(["contents:write", "issues:write", "pull-requests:write"]),
+    "release App token must grant exactly contents:write, issues:write, and pull-requests:write",
+  );
+  invariant(
+    JSON.stringify(tokenPermissions(recoveryTokenStep)) === JSON.stringify(["contents:read"]),
+    "recovery App token must grant exactly contents:read",
+  );
   includes(release, "token: ${{ steps.app-token.outputs.token }}", "Release Please must use only the app installation token");
   invariant(!/(secrets\.GITHUB_TOKEN|github\.token|\bNPM_TOKEN\b)/.test(`${pullRequest}\n${release}`), "GITHUB_TOKEN fallback and NPM_TOKEN are forbidden");
   includes(release, "config-file: release-please-config.json", "Release Please config is required");
@@ -80,6 +97,7 @@ export function verifyWorkflowSources({ pullRequest, release, packageJson }) {
   includes(release, 'gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --auto --squash', "release PRs must enable squash auto-merge");
 
   includes(release, "ref: ${{ steps.target.outputs.tag }}", "publish must check out the exact emitted or recovery tag");
+  includes(release, "fetch-depth: 0", "release checkout must fetch main history for ancestry verification");
   includes(release, "persist-credentials: false", "release checkout must not persist credentials");
   includes(release, "node-version: 22.19.0", "publish must use Node 22.19.0");
   includes(release, "registry-url: https://registry.npmjs.org", "publish must target the npm registry");
@@ -91,11 +109,16 @@ export function verifyWorkflowSources({ pullRequest, release, packageJson }) {
   includes(release, '[[ "$(jq -r \'.isDraft\' <<< "$release")" == "false" ]]', "recovery must reject draft releases");
   includes(release, 'EXPECTED_TAG="v${VERSION}"', "publish must derive the exact v-prefixed version tag");
   includes(release, 'git rev-parse "refs/tags/$TARGET_TAG^{commit}"', "publish must verify the checked-out tag commit");
+  includes(release, "git merge-base --is-ancestor HEAD refs/remotes/origin/main", "publish must reject release tags outside main history");
+  includes(release, "if [[ \"$VERSION\" == *-* ]]", "prerelease versions must be detected from exact SemVer metadata");
+  includes(release, "DIST_TAG=next", "prerelease versions must use the safe next dist-tag");
+  includes(release, "DIST_TAG=latest", "stable versions must explicitly use the latest dist-tag");
   includes(release, 'npm view "$PACKAGE_NAME@$VERSION" version --json', "publish must query npm before publishing");
   includes(release, 'if [[ "$RECOVERY" == "true" ]]; then', "an existing package must make recovery a no-op");
   includes(release, "refusing duplicate normal publish", "normal mode must fail on an existing package version");
-  includes(release, "if ! grep -q 'E404'", "only an npm not-found response may be treated as absent");
-  invariant(occurrences(release, /^\s*run: npm publish --access public --provenance$/gm) === 1, "publish command must be exactly npm publish --access public --provenance");
+  includes(release, 'payload?.error?.code !== "E404"', "only a structured npm E404 response may be treated as absent");
+  includes(release, "latest|next", "publish must reject unexpected npm dist-tags");
+  invariant(occurrences(release, /^\s*npm publish --access public --provenance --tag "\$DIST_TAG"$/gm) === 1, "publish command must include provenance and the validated dist-tag exactly once");
 
   assertImmutableActionPins(`${pullRequest}\n${release}`);
 

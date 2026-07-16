@@ -59,9 +59,10 @@ The workflow calls `gh pr merge --auto --squash`; repository auto-merge, squash 
 
 ### 3. Install and configure the `nerv-ops` GitHub App
 
-Install `nerv-ops` on `10ego/pi-footer-display`, limiting repository access to this repository if possible. Its repository permissions must permit the operations used by the workflow:
+Install `nerv-ops` on `10ego/pi-footer-display`, limiting repository access to this repository if possible. Supplying an App ID and private key is not sufficient: `actions/create-github-app-token` can issue a repository-scoped installation token only when the App has an active installation with access to this repository. The installation's repository permissions must permit the operations required by pinned Release Please v4.4.1:
 
 - **Contents: read and write** — create/update the release branch, commit release metadata, and create tags and GitHub releases.
+- **Issues: read and write** — maintain Release Please's release-tracking labels and issue metadata.
 - **Pull requests: read and write** — create/update the Release Please PR and enable squash auto-merge.
 - **Metadata: read-only** — GitHub's required baseline App permission.
 
@@ -74,7 +75,7 @@ Add these repository-level Actions values:
 - Variable `NERV_OPS_APP_ID`: the numeric App ID.
 - Secret `NERV_OPS_PRIVATE_KEY`: the App private key in PEM form.
 
-The workflow exchanges them for short-lived installation tokens. Keep the private key only in the authorized secret store: do not save it in a tracked file, shell transcript, package tarball, issue, or pull request.
+The workflow exchanges them for short-lived installation tokens and narrows each token at creation time: release automation requests only Contents write, Issues write, and Pull requests write, while recovery verification requests only Contents read. Keep the private key only in the authorized secret store: do not save it in a tracked file, shell transcript, package tarball, issue, or pull request.
 
 Leave `NPM_TRUSTED_PUBLISHING_READY` and `RELEASE_AUTOMATION_ENABLED` absent or not `true`.
 
@@ -117,9 +118,9 @@ For the npm package `pi-footer-display`, add a GitHub Actions trusted publisher 
 
 - GitHub organization or user: `10ego`
 - Repository: `pi-footer-display`
-- Workflow: `.github/workflows/release-please.yml`
+- Workflow filename: `release-please.yml` (the tracked file is `.github/workflows/release-please.yml`)
 
-Do not configure an environment unless the workflow is changed to use that exact environment. The workflow requests `id-token: write`, installs npm `11.5.1`, and publishes with `npm publish --access public --provenance`; it does not read `NPM_TOKEN`.
+npm's trusted-publisher field takes the filename, not the repository-relative path. Do not configure an environment unless the workflow is changed to use that exact environment. The workflow requests `id-token: write`, installs npm `11.5.1`, and publishes with provenance plus an explicit safe dist-tag (`latest` for stable versions or `next` for prereleases); it does not read `NPM_TOKEN`.
 
 ### 7. Mark trusted publishing ready
 
@@ -164,8 +165,8 @@ Once enabled, the normal lifecycle is:
 4. The workflow enables squash auto-merge on each created release PR. Repository rules hold the PR until `Validate PR title` and `Test` pass.
 5. Squash-merging the release PR pushes synchronized version/changelog metadata to `main` and triggers the workflow again.
 6. Release Please creates the exact `v<version>` tag and a GitHub release.
-7. The publish job checks out that exact tag without persisted credentials, installs dependencies, runs tests, verifies synchronized release metadata and package contents, and verifies that the tag resolves to the checked-out commit.
-8. If npm reports the version absent with `E404`, npm trusted publishing supplies short-lived OIDC credentials and the workflow publishes publicly with provenance.
+7. The publish job checks out that exact tag without persisted credentials, fetches full history, installs dependencies, runs tests, verifies synchronized release metadata and package contents, verifies that the tag resolves to the checked-out commit, and rejects a tag commit that is not an ancestor of `origin/main`.
+8. If npm returns a structured `E404` response for the exact version, npm trusted publishing supplies short-lived OIDC credentials and the workflow publishes publicly with provenance. Stable versions explicitly use npm dist-tag `latest`; semantic-version prereleases use `next` so they cannot replace `latest`.
 
 A normal run with no release created does not publish. A normal run finding its version already on npm fails rather than silently accepting a duplicate; investigate before retrying.
 
@@ -194,7 +195,7 @@ gh workflow run .github/workflows/release-please.yml \
   -f tag='v1.2.3'
 ```
 
-The input must be the complete tag, not a branch, SHA, version range, or unprefixed version. In recovery mode the release job skips. The publish job uses the App token to verify that the named GitHub release exists and is not a draft, checks out the exact tag, derives the package version from it, and runs all normal verification before considering publication.
+The input must be the complete tag, not a branch, SHA, version range, or unprefixed version. In recovery mode the release job skips. The publish job uses the read-only App token to verify that the named GitHub release exists and is not a draft, checks out the exact tag, derives the package version from it, and runs all normal verification before considering publication. The tag commit must be in `main` history, so even a non-draft release pointing to an arbitrary side-branch commit cannot publish.
 
 npm duplicate handling is intentionally mode-specific:
 
@@ -217,7 +218,7 @@ Do not open the gates simply to diagnose missing prerequisites.
 
 ### App token creation fails
 
-Verify that `NERV_OPS_APP_ID` is the numeric ID, `NERV_OPS_PRIVATE_KEY` contains the complete matching PEM key, and the `nerv-ops` App is installed on this repository. Then verify Contents and Pull requests read/write permissions. Rotate a suspected private key in GitHub and the secret store; never commit it.
+Verify that `NERV_OPS_APP_ID` is the numeric ID, `NERV_OPS_PRIVATE_KEY` contains the complete matching PEM key, and the `nerv-ops` App has an active installation with access to this repository. Then verify Contents, Issues, and Pull requests read/write permissions. Rotate a suspected private key in GitHub and the secret store; never commit it.
 
 ### The release PR is not created or updated
 
@@ -244,7 +245,7 @@ Do not bypass a failing required check to force a release.
 
 ### The publish job cannot obtain npm credentials
 
-Confirm the npm trusted publisher exactly names owner `10ego`, repository `pi-footer-display`, and workflow `.github/workflows/release-please.yml`, with no unmatched environment restriction. The workflow deliberately has no npm token fallback. Keep the gate closed until OIDC configuration is corrected.
+Confirm the npm trusted publisher exactly names owner `10ego`, repository `pi-footer-display`, and workflow filename `release-please.yml`, with no unmatched environment restriction. The workflow deliberately has no npm token fallback. Keep the gate closed until OIDC configuration is corrected.
 
 ### npm availability check fails
 
@@ -254,11 +255,11 @@ Check the exact version manually:
 npm view pi-footer-display@VERSION version --json
 ```
 
-`E404` means the version is absent. Any other error is not proof of absence and the workflow correctly refuses to publish. If a normal run reports a duplicate, verify the npm artifact and GitHub release before choosing recovery; do not change or reuse the tag.
+A structured npm JSON error with code `E404` means the version is absent. Any malformed response or other error is not proof of absence and the workflow correctly refuses to publish. If a normal run reports a duplicate, verify the npm artifact and GitHub release before choosing recovery; do not change or reuse the tag.
 
 ### Recovery rejects the tag or release
 
-Use an exact tag such as `v1.2.3` and verify that a non-draft GitHub release already exists for exactly that tag. Recovery does not create releases, accept draft releases, or accept arbitrary commits. The checked-out tag must resolve to the commit being verified.
+Use an exact tag such as `v1.2.3` and verify that a non-draft GitHub release already exists for exactly that tag. Recovery does not create releases, accept draft releases, or accept arbitrary commits. The checked-out tag must resolve to the commit being verified, and that commit must be an ancestor of `origin/main`.
 
 ### Tests or package inspection fail at the tag
 
