@@ -545,9 +545,7 @@ jobs:
           metadata_expired="$(jq -er 'if (.expired | type) == "boolean" then (.expired | tostring) else error("invalid artifact expiration status") end' "$metadata_file")"
           metadata_digest="$(jq -er 'if (.digest | type) == "string" then .digest else error("invalid artifact digest") end' "$metadata_file")"
           workflow_run_id="$(jq -er '
-            if (.workflow_run? == null) or (.workflow_run.id? == null) then
-              ""
-            elif (.workflow_run.id | type) == "number" then
+            if (.workflow_run.id | type) == "number" then
               (.workflow_run.id | tostring)
             else
               error("invalid artifact workflow run id")
@@ -570,10 +568,10 @@ jobs:
             echo "Artifact metadata digest does not match the upload digest" >&2
             exit 1
           }
-          if [[ -n "$workflow_run_id" && "$workflow_run_id" != "$GITHUB_RUN_ID" ]]; then
+          [[ "$workflow_run_id" == "$GITHUB_RUN_ID" ]] || {
             echo "Artifact $ARTIFACT_ID belongs to workflow run $workflow_run_id, not $GITHUB_RUN_ID" >&2
             exit 1
-          fi
+          }
 
       - name: Download exact release tarball artifact
         id: download
