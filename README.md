@@ -245,4 +245,4 @@ npm pack --dry-run   # inspect the npm package contents without publishing
 git diff --check     # detect whitespace errors
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the state, refresh, and lifecycle design. Contributions and issue reports are welcome in the [GitHub repository](https://github.com/10ego/pi-footer-display).
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the state, refresh, and lifecycle design. Release maintainers should follow the fail-closed bootstrap and operating runbook in [RELEASING.md](RELEASING.md). Contributions and issue reports are welcome in the [GitHub repository](https://github.com/10ego/pi-footer-display).
