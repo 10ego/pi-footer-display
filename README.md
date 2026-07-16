@@ -102,36 +102,44 @@ gh auth status
 
 If needed, authenticate using `gh auth login`. The extension remains useful without `gh` or authentication; it displays local repository and branch data with `!`.
 
-## Use from a local checkout
+## Install and use
 
-This repository currently has no configured Git remote and does not claim an npm publication. Use an existing local checkout path.
+The canonical source is [github.com/10ego/pi-footer-display](https://github.com/10ego/pi-footer-display).
 
-For development, install dependencies and load the TypeScript extension for one Pi run:
+Try the package for one Pi run without changing settings:
 
 ```bash
+pi -e https://github.com/10ego/pi-footer-display
+```
+
+Install it in your user settings:
+
+```bash
+pi install https://github.com/10ego/pi-footer-display
+```
+
+Use `--local` to install it in a trusted project's `.pi/settings.json` instead:
+
+```bash
+pi install https://github.com/10ego/pi-footer-display --local
+```
+
+Update the installed GitHub package later with:
+
+```bash
+pi update https://github.com/10ego/pi-footer-display
+```
+
+For local development, clone the repository, install dependencies, and load the TypeScript entry point for one run:
+
+```bash
+git clone https://github.com/10ego/pi-footer-display.git
+cd pi-footer-display
 npm install
 pi --extension ./src/index.ts
 ```
 
-`--extension` does not add the extension to Pi settings. To exercise the checkout through its Pi package manifest for one run, pass the package directory with the `-e` alias:
-
-```bash
-pi -e /absolute/path/to/pi-footer-display
-```
-
-This temporary package source also leaves settings unchanged. To register the checkout as a Pi package, use the same absolute directory path with `pi install`:
-
-```bash
-pi install /absolute/path/to/pi-footer-display
-```
-
-That command adds the package to user settings. Add `--local` to write project-local `.pi/settings.json` instead (the project must be trusted):
-
-```bash
-pi install /absolute/path/to/pi-footer-display --local
-```
-
-No install command is run by this project automatically. If the package is published later, Pi's npm source form will be `npm:pi-footer-display`; do not assume that source exists until a release is announced.
+`--extension` does not add the extension to Pi settings. This project is not currently published to npm, so use the GitHub source shown above rather than `npm:pi-footer-display`.
 
 ## Cache and subprocess behavior
 
@@ -237,4 +245,4 @@ npm pack --dry-run   # inspect the npm package contents without publishing
 git diff --check     # detect whitespace errors
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the state, refresh, and lifecycle design. Development in this checkout is represented by local checkpoint commits only; there is no configured remote, and this project does not push or publish as part of its test workflow.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the state, refresh, and lifecycle design. Contributions and issue reports are welcome in the [GitHub repository](https://github.com/10ego/pi-footer-display).
