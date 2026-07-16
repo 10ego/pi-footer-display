@@ -38,7 +38,7 @@ Age is compact wall-clock time: seconds under one minute, whole minutes under on
 
 The extension resolves repository evidence in this priority order:
 
-1. Paths passed to Pi's `read`, `write`, or `edit` tools. Relative paths are resolved against Pi's current working directory.
+1. Paths passed to Pi's `read`, `write`, `edit`, `grep`, `find`, or `ls` tools. Relative paths are resolved against Pi's current working directory.
 2. Conservative absolute-path hints from simple `bash` calls: `git -C /absolute/path ...`, one absolute operand to a small path-oriented command allowlist, or `cd /absolute/path && <one simple command>`.
 3. The session's startup working directory as a weak startup fallback.
 
@@ -139,7 +139,7 @@ Repository discovery and metadata are deliberately bounded:
 | Candidate path → Git root | 128 | 5 minutes | 30 seconds |
 | Git root → repository/PR metadata | 32 | 60 seconds | 10 seconds |
 
-Least-recently-used-ish entries are evicted when a cache exceeds its bound. `/pr-footer refresh` invalidates the relevant entries. The once-per-second age redraw only reformats existing state; it does not invoke Git, `gh`, or network access.
+Least-recently-used-ish entries are evicted when a cache exceeds its bound. All degraded metadata—detached HEAD, no recognized GitHub remote, or unavailable GitHub lookup—uses the shorter 10-second metadata TTL; a successful lookup with no open PR is a positive result. `/pr-footer refresh` invalidates the relevant entries. The once-per-second age redraw only reformats existing state; it does not invoke Git, `gh`, or network access.
 
 Every `git` and `gh` operation is launched directly without a shell, has a 10-second timeout, and accepts at most 1 MiB of output. GitHub lookup uses an explicit target rather than ambient repository inference:
 
@@ -218,7 +218,7 @@ This is expected after resuming: age is persisted wall-clock session age and inc
 
 - Only `github.com` remotes with exactly `OWNER/REPO` paths are recognized; GitHub Enterprise and other forges receive local-only context.
 - PR matching is branch-based and displays only the first open result returned by `gh --limit 1`.
-- Automatic tracking intentionally recognizes only `read`, `write`, `edit`, and narrow bash path forms; other tools and complex commands do not influence selection.
+- Automatic tracking intentionally recognizes only `read`, `write`, `edit`, `grep`, `find`, `ls`, and narrow bash path forms; other tools and complex commands do not influence selection.
 - The footer shows repository, ref, optional PR number/draft state, degradation markers, and age only. It does not show PR title, checks, review state, or ahead/behind counts.
 - Cache TTLs trade freshness for bounded local and network work; use `/pr-footer refresh` when immediate freshness matters.
 

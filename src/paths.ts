@@ -1,23 +1,21 @@
 import path from "node:path";
 import type { PathHint } from "./types.js";
 
-const FILE_TOOLS = new Set(["read", "write", "edit"]);
-const EXPLICIT_PATH_COMMANDS = new Set([
+// Pi 0.80.7's built-in file-oriented ToolCallEvent variants all expose `path`.
+const FILE_TOOLS = new Set(["read", "write", "edit", "grep", "find", "ls"]);
+const DIRECT_PATH_COMMANDS = new Set([
   "cat",
   "file",
-  "find",
-  "grep",
   "head",
   "less",
   "ls",
   "readlink",
   "realpath",
-  "rg",
-  "sed",
   "stat",
   "tail",
   "wc",
 ]);
+const PROGRAM_THEN_PATH_COMMANDS = new Set(["grep", "rg", "sed"]);
 const PATH_KEYS = new Set(["path", "filePath", "file_path"]);
 
 function toolBasename(toolName: string): string {
@@ -121,6 +119,47 @@ function oneUnambiguousAbsolute(values: readonly string[]): string[] {
   return absolute.length === 1 ? absolute : [];
 }
 
+/** Return operands only when no option can consume a value and masquerade as a path. */
+function optionFreeOperands(args: readonly string[]): readonly string[] | undefined {
+  if (args[0] === "--") return args.slice(1);
+  return args.some((value) => value.startsWith("-")) ? undefined : args;
+}
+
+function directPaths(words: readonly string[]): string[] {
+  const executable = executableName(words[0] ?? "");
+  const args = words.slice(1);
+
+  if (executable === "git") {
+    const paths: string[] = [];
+    for (let index = 0; index < args.length - 1; index += 1) {
+      if (args[index] === "-C") paths.push(args[index + 1] ?? "");
+    }
+    return oneUnambiguousAbsolute(paths);
+  }
+
+  if (DIRECT_PATH_COMMANDS.has(executable)) {
+    const operands = optionFreeOperands(args);
+    return operands ? oneUnambiguousAbsolute(operands) : [];
+  }
+
+  if (PROGRAM_THEN_PATH_COMMANDS.has(executable)) {
+    const operands = optionFreeOperands(args);
+    // grep/rg patterns and sed programs are not file operands, even when absolute-looking.
+    return operands ? oneUnambiguousAbsolute(operands.slice(1)) : [];
+  }
+
+  if (executable === "find") {
+    const operands: string[] = [];
+    for (const value of args) {
+      if (value.startsWith("-") || value === "!" || value === "(" || value === ")") break;
+      operands.push(value);
+    }
+    return oneUnambiguousAbsolute(operands);
+  }
+
+  return [];
+}
+
 /**
  * Accepts only three bash hint shapes: `git -C /absolute`, explicit absolute
  * operands to a small path-oriented command allowlist, and
@@ -134,24 +173,20 @@ export function extractBashPaths(command: string): PathHint[] {
   if (conjunction !== -1) {
     if (conjunction !== 2 || words.indexOf("&&", conjunction + 1) !== -1) return [];
     if (words[0] !== "cd" || !path.isAbsolute(words[1] ?? "")) return [];
-    if (words.length <= 3) return [];
+    const tail = words.slice(3);
+    if (tail.length === 0 || executableName(tail[0] ?? "") === "cd") return [];
+
+    // An explicit file operand in the command after `cd` is stronger than its cwd.
+    const explicit = directPaths(tail);
+    if (explicit.length === 1) {
+      return [{ path: explicit[0] as string, source: "bash" }];
+    }
+    // Multiple or unrecognized absolute operands make the shell evidence ambiguous.
+    if (tail.some((value) => path.isAbsolute(value))) return [];
     return [{ path: words[1] as string, source: "bash" }];
   }
 
-  const executable = executableName(words[0] ?? "");
-  if (executable === "git") {
-    const paths: string[] = [];
-    for (let index = 1; index < words.length - 1; index += 1) {
-      if (words[index] === "-C") paths.push(words[index + 1] ?? "");
-    }
-    return oneUnambiguousAbsolute(paths).map((value) => ({ path: value, source: "bash" }));
-  }
-
-  if (!EXPLICIT_PATH_COMMANDS.has(executable)) return [];
-  return oneUnambiguousAbsolute(words.slice(1)).map((value) => ({
-    path: value,
-    source: "bash",
-  }));
+  return directPaths(words).map((value) => ({ path: value, source: "bash" }));
 }
 
 export function fallbackPath(cwd: string): PathHint {

@@ -51,7 +51,13 @@ export function parseGitHubRemote(remote: string): GitHubRepository | undefined 
   const repoPart = parts[1];
   if (!owner || !repoPart) return undefined;
   const repo = repoPart.replace(/\.git$/iu, "");
-  if (!repo) return undefined;
+  // Reject encoded separators and URL-shaped lookalikes before passing a slug to gh.
+  if (
+    !/^(?!-)[A-Za-z0-9-]{1,39}(?<!-)$/u.test(owner) ||
+    !/^(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}$/u.test(repo)
+  ) {
+    return undefined;
+  }
   return { owner, repo };
 }
 
@@ -98,8 +104,21 @@ export class GitRepositoryInspector implements RepositoryInspector {
       const info = await this.#fs.stat(candidatePath);
       return info.isDirectory() ? candidatePath : path.dirname(candidatePath);
     } catch {
-      // File-tool paths often identify a file that is about to be created.
-      return path.dirname(candidatePath);
+      // Tool calls happen before execution, so a write target may have several
+      // not-yet-created parent directories. Walk to the nearest existing directory.
+      const fallback = path.dirname(candidatePath);
+      let current = fallback;
+      while (true) {
+        try {
+          const info = await this.#fs.stat(current);
+          if (info.isDirectory()) return current;
+        } catch {
+          // Continue toward the filesystem root.
+        }
+        const parent = path.dirname(current);
+        if (parent === current) return fallback;
+        current = parent;
+      }
     }
   }
 

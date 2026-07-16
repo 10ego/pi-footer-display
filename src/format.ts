@@ -15,15 +15,34 @@ export function formatAge(startedAt: number, now = Date.now()): string {
   return `${days}d${hours % 24 ? `${hours % 24}h` : ""}`;
 }
 
+const MAX_REPOSITORY_LABEL = 64;
+const MAX_REFERENCE_LABEL = 48;
+
+/** Keep untrusted Git/path text single-line, control-free, and bounded. */
+export function formatDisplaySegment(value: string, maxCodePoints: number): string {
+  const clean = value
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  const points = Array.from(clean);
+  if (points.length === 0) return "?";
+  if (points.length <= maxCodePoints) return clean;
+  return `${points.slice(0, Math.max(1, maxCodePoints - 1)).join("")}…`;
+}
+
 function repositoryLabel(metadata: RepositoryMetadata): string {
-  return metadata.github
-    ? `${metadata.github.owner}/${metadata.github.repo}`
-    : metadata.name;
+  return formatDisplaySegment(
+    metadata.github
+      ? `${metadata.github.owner}/${metadata.github.repo}`
+      : metadata.name,
+    MAX_REPOSITORY_LABEL,
+  );
 }
 
 function metadataParts(metadata: RepositoryMetadata): string[] {
   const parts = [repositoryLabel(metadata)];
-  parts.push(metadata.ref.detached ? `@${metadata.ref.name}` : metadata.ref.name);
+  const reference = formatDisplaySegment(metadata.ref.name, MAX_REFERENCE_LABEL);
+  parts.push(metadata.ref.detached ? `@${reference}` : reference);
   if (metadata.pullRequest) {
     parts.push(`${metadata.pullRequest.isDraft ? "draft " : ""}PR #${metadata.pullRequest.number}`);
   }

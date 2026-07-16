@@ -55,6 +55,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function recordValue(value: unknown, key: string): unknown {
+  return isRecord(value) ? value[key] : undefined;
+}
+
 function validTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
@@ -156,7 +160,7 @@ export class FooterExtensionRuntime {
   #pendingHints = new Map<string, PathHint>();
   #lifecycle = 0;
   #disposed = true;
-  #transitioning = false;
+  #transitionCount = 0;
 
   constructor(pi: ExtensionAPI, options: FooterExtensionOptions = {}) {
     this.#pi = pi;
@@ -197,6 +201,10 @@ export class FooterExtensionRuntime {
     this.#lastPersisted = restoration.fromEntry ? restored : undefined;
     this.#controller = new FooterSessionController(restored.startedAt);
 
+    this.#ageTimer = setInterval(() => {
+      if (this.#active(lifecycle)) this.#publish();
+    }, this.#ageIntervalMs);
+
     try {
       this.#dependencies = this.#createDependencies();
     } catch (error) {
@@ -206,10 +214,6 @@ export class FooterExtensionRuntime {
       this.#persistIfChanged();
       return;
     }
-
-    this.#ageTimer = setInterval(() => {
-      if (this.#active(lifecycle)) this.#publish();
-    }, this.#ageIntervalMs);
 
     const [pinnedRoot, lastConfirmedRoot] = await Promise.all([
       restored.mode === "pinned" && restored.pinnedRoot
@@ -240,14 +244,14 @@ export class FooterExtensionRuntime {
   observeToolCall(event: ToolCallEvent, ctx: ExtensionContext): void {
     if (
       this.#disposed ||
-      this.#transitioning ||
+      this.#transitionCount > 0 ||
       this.#controller?.state.mode !== "auto"
     ) {
       return;
     }
 
     const hints = extractFileToolPaths(event.toolName, event.input, ctx.cwd);
-    const command = (event.input as Record<string, unknown>)["command"];
+    const command = recordValue(event.input, "command");
     if (event.toolName === "bash" && typeof command === "string") {
       hints.push(...extractBashPaths(command));
     }
@@ -309,7 +313,7 @@ export class FooterExtensionRuntime {
     const controller = this.#controller;
     if (!controller) return;
     const guardGeneration = controller.beginRefresh();
-    this.#transitioning = true;
+    this.#transitionCount += 1;
     this.#clearPendingHints();
 
     try {
@@ -321,6 +325,7 @@ export class FooterExtensionRuntime {
       }
 
       this.#dependencies?.core.invalidatePath(candidate);
+      this.#dependencies?.core.invalidatePath(root);
       this.#dependencies?.core.invalidateRepository(root);
       const outcome = await this.#safeResolve([
         { path: root, source: "file" },
@@ -336,7 +341,9 @@ export class FooterExtensionRuntime {
       this.#persistIfChanged();
       ctx.ui.notify(`Pinned repository: ${root}`, "info");
     } finally {
-      if (this.#active(lifecycle)) this.#transitioning = false;
+      if (this.#active(lifecycle)) {
+        this.#transitionCount = Math.max(0, this.#transitionCount - 1);
+      }
     }
   }
 
@@ -386,7 +393,7 @@ export class FooterExtensionRuntime {
   async #flushObservedHints(lifecycle: number): Promise<void> {
     if (
       !this.#active(lifecycle) ||
-      this.#transitioning ||
+      this.#transitionCount > 0 ||
       this.#controller?.state.mode !== "auto"
     ) {
       this.#pendingHints.clear();
@@ -478,14 +485,22 @@ export class FooterExtensionRuntime {
     if (this.#disposed) return;
     const snapshot = this.#snapshot();
     if (!snapshot || sameSnapshot(this.#lastPersisted, snapshot)) return;
-    this.#pi.appendEntry(FOOTER_STATE_ENTRY, snapshot);
-    this.#lastPersisted = snapshot;
+    try {
+      this.#pi.appendEntry(FOOTER_STATE_ENTRY, snapshot);
+      this.#lastPersisted = snapshot;
+    } catch {
+      // Persistence failure must not break tool calls, timers, or session startup.
+    }
   }
 
   #publish(): void {
     const state = this.#controller?.state;
     if (!state || this.#disposed) return;
-    this.#ctx?.ui.setStatus(FOOTER_STATUS_KEY, formatFooter(state, this.#now()));
+    try {
+      this.#ctx?.ui.setStatus(FOOTER_STATUS_KEY, formatFooter(state, this.#now()));
+    } catch {
+      // A stale or unavailable UI during replacement must not escape a timer callback.
+    }
   }
 
   #notifyStatus(ctx: ExtensionCommandContext): void {
@@ -524,13 +539,17 @@ export class FooterExtensionRuntime {
   #cleanup(): void {
     this.#lifecycle += 1;
     this.#disposed = true;
-    this.#transitioning = false;
+    this.#transitionCount = 0;
     if (this.#ageTimer) clearInterval(this.#ageTimer);
     this.#ageTimer = undefined;
     this.#clearPendingHints();
     this.#controller?.cleanup();
     this.#dependencies?.core.clear();
-    this.#ctx?.ui.setStatus(FOOTER_STATUS_KEY, undefined);
+    try {
+      this.#ctx?.ui.setStatus(FOOTER_STATUS_KEY, undefined);
+    } catch {
+      // The previous Pi context may already be stale during a reload/replacement.
+    }
     this.#dependencies = undefined;
     this.#controller = undefined;
     this.#ctx = undefined;

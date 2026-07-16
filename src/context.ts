@@ -31,13 +31,13 @@ export class DefaultRepositoryMetadataLoader implements RepositoryMetadataLoader
     if (!identity.github) {
       return {
         metadata: { ...identity, degraded: ["no-github-remote"] },
-        polarity: "positive",
+        polarity: "negative",
       };
     }
     if (identity.ref.detached) {
       return {
         metadata: { ...identity, degraded: ["detached-head"] },
-        polarity: "positive",
+        polarity: "negative",
       };
     }
 

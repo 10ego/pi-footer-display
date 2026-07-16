@@ -6,7 +6,12 @@ import {
   DefaultRepositoryMetadataLoader,
   type RepositoryMetadataLoader,
 } from "../src/context.js";
-import { formatFooter } from "../src/format.js";
+import type {
+  FindToolInput,
+  GrepToolInput,
+  LsToolInput,
+} from "@earendil-works/pi-coding-agent";
+import { formatDisplaySegment, formatFooter } from "../src/format.js";
 import { GitRepositoryInspector, parseGitHubRemote, type RepositoryInspector } from "../src/git.js";
 import { GhPullRequestLookup } from "../src/github.js";
 import { extractBashPaths, extractFileToolPaths } from "../src/paths.js";
@@ -39,6 +44,12 @@ test("extracts strong file paths and only narrow bash forms", () => {
   ]);
   assert.deepEqual(extractBashPaths("cat /work/repo/README.md"), [
     { path: "/work/repo/README.md", source: "bash" },
+  ]);
+  assert.deepEqual(extractBashPaths("grep needle /work/repo/src"), [
+    { path: "/work/repo/src", source: "bash" },
+  ]);
+  assert.deepEqual(extractBashPaths("cd /work/a && cat /work/b/file"), [
+    { path: "/work/b/file", source: "bash" },
   ]);
   assert.deepEqual(extractBashPaths("echo /work/not-evidence"), []);
   assert.deepEqual(extractBashPaths("cat /work/a | tee /work/b"), []);
@@ -193,7 +204,20 @@ test("formatter includes repository, branch, PR, age, and markers", () => {
   );
 });
 
-test("file tools accept Pi path shapes and normalize relative arrays", () => {
+test("file tools accept Pi 0.80.7 path inputs and normalize relative arrays", () => {
+  const piInputs: Array<[string, FindToolInput | GrepToolInput | LsToolInput]> = [
+    ["find", { pattern: "*.ts", path: "src" }],
+    ["grep", { pattern: "needle", path: "/other/repo" }],
+    ["ls", { path: "." }],
+  ];
+  assert.deepEqual(
+    piInputs.flatMap(([toolName, input]) => extractFileToolPaths(toolName, input, "/repo")),
+    [
+      { path: "/repo/src", source: "file" },
+      { path: "/other/repo", source: "file" },
+      { path: "/repo", source: "file" },
+    ],
+  );
   assert.deepEqual(
     extractFileToolPaths(
       "functions.edit",
@@ -226,6 +250,12 @@ test("bash extraction rejects ambiguous and injection-like syntax", () => {
     "cd /repo &&",
     "cd /repo && npm test && echo done",
     "git -C /repo -C /other status",
+    "grep /absolute-looking-regex relative.txt",
+    "sed /absolute-looking-program/d relative.txt",
+    "find relative -name /absolute-looking-pattern",
+    "head -n /absolute-looking-count relative.txt",
+    "cd /repo && cd /other",
+    "cd /repo && cat /other/a /third/b",
   ]) {
     assert.deepEqual(extractBashPaths(command), [], command);
   }
@@ -251,6 +281,8 @@ test("parses URL variants without accepting lookalike or non-GitHub remotes", ()
     "git@gitlab.com:acme/widget.git",
     "https://github.com/acme",
     "https://github.com/acme/widget/extra",
+    "https://github.com/acme/widget%2Fextra.git",
+    "https://github.com/-invalid/widget.git",
   ]) {
     assert.equal(parseGitHubRemote(remote), undefined, remote);
   }
@@ -401,11 +433,11 @@ test("metadata loader degrades safely for local-only, detached, and failed gh lo
 
   assert.deepEqual(await loader.load("/local"), {
     metadata: { ...identities.get("/local")!, degraded: ["no-github-remote"] },
-    polarity: "positive",
+    polarity: "negative",
   });
   assert.deepEqual(await loader.load("/detached"), {
     metadata: { ...identities.get("/detached")!, degraded: ["detached-head"] },
-    polarity: "positive",
+    polarity: "negative",
   });
   assert.deepEqual(await loader.load("/github"), {
     metadata: { ...identities.get("/github")!, degraded: ["github-unavailable"] },
@@ -446,6 +478,23 @@ test("gh lookup distinguishes no PR from command and response failures", async (
     malformed.findOpenPullRequest({ owner: "acme", repo: "widget" }, "main"),
     SyntaxError,
   );
+
+  for (const stdout of [
+    "{}",
+    '[{"number":7,"state":"CLOSED","isDraft":false,"url":"https://example/7"}]',
+    '[{"number":"7","state":"OPEN","isDraft":false,"url":"https://example/7"}]',
+    '[{"number":7,"state":"OPEN","isDraft":false,"url":"not a URL"}]',
+  ]) {
+    const invalid = new GhPullRequestLookup({
+      async run() {
+        return { stdout, stderr: "" };
+      },
+    });
+    await assert.rejects(
+      invalid.findOpenPullRequest({ owner: "acme", repo: "widget" }, "main"),
+      /gh returned/u,
+    );
+  }
 });
 
 test("context falls through non-repositories and coalesces candidates for one root", async () => {
@@ -505,4 +554,53 @@ test("context converts metadata failures to unavailable outcomes", async () => {
     kind: "unavailable",
     reason: "git disappeared",
   });
+});
+
+test("git discovery walks to an existing ancestor for nested write targets", async () => {
+  const calls: Array<{ file: string; args: readonly string[] }> = [];
+  const inspector = new GitRepositoryInspector(
+    {
+      async run(file, args) {
+        calls.push({ file, args });
+        return { stdout: "/repo\n", stderr: "" };
+      },
+    },
+    {
+      async stat(value) {
+        if (value === "/repo") return { isDirectory: () => true };
+        throw new Error("ENOENT");
+      },
+      async realpath(value) {
+        return value;
+      },
+    },
+  );
+
+  assert.equal(await inspector.findRoot("/repo/new/deep/file.ts"), "/repo");
+  assert.deepEqual(calls[0], {
+    file: "git",
+    args: ["-C", "/repo", "rev-parse", "--show-toplevel"],
+  });
+});
+
+test("formatter bounds dynamic labels and removes all control text", () => {
+  assert.equal(formatDisplaySegment("feature\u001b[31m\nnext", 12), "feature [31…");
+  const unsafe: FooterSessionState = {
+    mode: "auto",
+    startedAt: 0,
+    generation: 1,
+    ownsStatus: true,
+    outcome: {
+      kind: "resolved",
+      metadata: {
+        root: "/repo",
+        name: `repo\u0000${"x".repeat(100)}`,
+        ref: { name: "main\u009bcontrol", detached: false },
+        degraded: [],
+      },
+    },
+  };
+  const text = formatFooter(unsafe, 1_000);
+  assert.doesNotMatch(text, /[\u0000-\u001f\u007f-\u009f]/u);
+  assert.ok(text.length < 140, text);
 });

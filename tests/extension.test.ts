@@ -123,6 +123,24 @@ function readCall(path: string): ToolCallEvent {
   };
 }
 
+function pathToolCall(toolName: "grep" | "find" | "ls", path: string): ToolCallEvent {
+  return {
+    type: "tool_call",
+    toolCallId: `${toolName}:${path}`,
+    toolName,
+    input: { path, pattern: "needle" },
+  } as ToolCallEvent;
+}
+
+function bashCall(command: string): ToolCallEvent {
+  return {
+    type: "tool_call",
+    toolCallId: command,
+    toolName: "bash",
+    input: { command },
+  };
+}
+
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -225,6 +243,34 @@ test("debounces file evidence, reports conflicts, switches once, and pinned mode
   runtime.observeToolCall(readCall("/repo/c/ignored.ts"), ctx);
   await wait(30);
   assert.equal(harness.statuses.at(-1)?.text, statusAfterPin);
+
+  runtime.shutdown(ctx);
+});
+
+test("grep, find, and ls paths are strong extension evidence over bash hints", async () => {
+  const harness = createHarness();
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: dependencies,
+    debounceMs: 5,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+  await runtime.start(ctx);
+
+  for (const [toolName, target, weaker] of [
+    ["grep", "/repo/b/src", "/repo/c"],
+    ["find", "/repo/c", "/repo/a"],
+    ["ls", "/repo/b", "/repo/a"],
+  ] as const) {
+    runtime.observeToolCall(pathToolCall(toolName, target), ctx);
+    runtime.observeToolCall(bashCall(`git -C ${weaker} status`), ctx);
+    await wait(15);
+    assert.match(
+      harness.statuses.at(-1)?.text ?? "",
+      new RegExp(`^acme/${target.split("/")[2]}`, "u"),
+      toolName,
+    );
+  }
 
   runtime.shutdown(ctx);
 });
@@ -447,21 +493,65 @@ test("commands report unavailable state and cover pin, refresh, unpin, and statu
   assert.equal(harness.notifications.at(-1)?.type, "warning");
 });
 
-test("dependency factory failure is contained and command operations remain unavailable", async () => {
+test("dependency factory failure is contained while the age timer keeps updating", async () => {
   const harness = createHarness();
+  let now = 10_000;
   const runtime = registerFooterDisplay(harness.pi, {
     createDependencies() {
       throw new Error("missing git executable");
     },
-    ageIntervalMs: 60_000,
-    now: () => 10_000,
+    ageIntervalMs: 5,
+    now: () => now,
   });
   const ctx = context(harness);
   await runtime.start(ctx);
-  assert.match(harness.statuses.at(-1)?.text ?? "", /^repo — · !/u);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^repo — · ! · 9s$/u);
   assert.equal(harness.appended.length, 1);
+
+  now = 71_000;
+  await wait(15);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^repo — · ! · 1m$/u);
   await runtime.handleCommand("refresh", ctx);
   assert.equal(harness.notifications.at(-1)?.type, "warning");
+  runtime.shutdown(ctx);
+});
+
+test("persistence and status UI exceptions do not escape startup, timers, refresh, or cleanup", async () => {
+  const harness = createHarness();
+  let appendAttempts = 0;
+  let statusAttempts = 0;
+  const pi = {
+    on() {},
+    registerCommand() {},
+    appendEntry() {
+      appendAttempts += 1;
+      throw new Error("session log is read-only");
+    },
+  } as unknown as ExtensionAPI;
+  const baseCtx = context(harness);
+  const ctx = {
+    ...baseCtx,
+    ui: {
+      setStatus() {
+        statusAttempts += 1;
+        throw new Error("status area is unavailable");
+      },
+      notify(message: string, type?: string) {
+        harness.notifications.push({ message, type });
+      },
+    },
+  } as unknown as ExtensionContext & ExtensionCommandContext;
+  const runtime = registerFooterDisplay(pi, {
+    createDependencies: dependencies,
+    ageIntervalMs: 5,
+  });
+
+  await runtime.start(ctx);
+  assert.equal(appendAttempts, 1);
+  await wait(15);
+  assert.ok(statusAttempts >= 2);
+  await runtime.handleCommand("refresh", ctx);
+  assert.ok(appendAttempts >= 2);
   runtime.shutdown(ctx);
 });
 
@@ -488,6 +578,71 @@ test("startedAt remains stable across refresh and restored runtime starts", asyn
   assert.equal(harness.appended.length, 0);
   assert.match(harness.statuses.at(-1)?.text ?? "", / · 2m$/u);
   runtime.shutdown(restoredContext);
+});
+
+test("concurrent pin transitions keep tool evidence blocked until every pin settles", async () => {
+  const harness = createHarness();
+  const findCounts = new Map<string, number>();
+  let finishB: (() => void) | undefined;
+  let finishC: (() => void) | undefined;
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      findCounts.set(candidate, (findCounts.get(candidate) ?? 0) + 1);
+      const root = ["/repo/a", "/repo/b", "/repo/c"].find(
+        (value) => candidate === value || candidate.startsWith(`${value}/`),
+      );
+      if (!root) return null;
+      if (candidate === "/repo/b" && findCounts.get(candidate) === 1) {
+        await new Promise<void>((resolve) => {
+          finishB = resolve;
+        });
+      }
+      if (candidate === "/repo/c" && findCounts.get(candidate) === 1) {
+        await new Promise<void>((resolve) => {
+          finishC = resolve;
+        });
+      }
+      return root;
+    },
+    async readIdentity(root) {
+      return metadata(root);
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    debounceMs: 5,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+  await runtime.start(ctx);
+
+  const firstPin = runtime.handleCommand("pin /repo/b", ctx);
+  const secondPin = runtime.handleCommand("pin /repo/c", ctx);
+  await wait(0);
+  assert.ok(finishB);
+  assert.ok(finishC);
+
+  finishB();
+  await firstPin;
+  runtime.observeToolCall(readCall("/repo/a/interrupt.ts"), ctx);
+  await wait(15);
+  assert.equal(findCounts.get("/repo/a/interrupt.ts"), undefined);
+
+  finishC();
+  await secondPin;
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^📌 acme\/c/u);
+  assert.equal(harness.notifications.at(-1)?.message, "Pinned repository: /repo/c");
+  runtime.shutdown(ctx);
 });
 
 test("newer debounced resolution rejects an older async generation", async () => {
