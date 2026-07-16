@@ -20,7 +20,7 @@ import {
 } from "../src/git.js";
 import { GhPullRequestLookup } from "../src/github.js";
 import { extractBashPaths, extractFileToolPaths } from "../src/paths.js";
-import { ProcessExecutionError, type CommandRunner } from "../src/process.js";
+import { ExecFileRunner, ProcessExecutionError, type CommandRunner } from "../src/process.js";
 import { FooterSessionController } from "../src/state.js";
 import type {
   FooterSessionState,
@@ -303,7 +303,21 @@ test("parses URL variants without accepting lookalike or non-GitHub remotes", ()
   }
 });
 
-test("git discovery distinguishes deleted roots, no-repo exits, and process failures", async () => {
+test("process runner preserves stderr separately from its display message", async () => {
+  const runner = new ExecFileRunner();
+  await assert.rejects(
+    runner.run(process.execPath, ["-e", "process.stderr.write('structured stderr\\n'); process.exit(7)"]),
+    (error: unknown) => {
+      assert.ok(error instanceof ProcessExecutionError);
+      assert.equal(error.kind, "exit");
+      assert.equal(error.exitCode, 7);
+      assert.equal(error.stderr, "structured stderr\n");
+      return true;
+    },
+  );
+});
+
+test("git discovery confirms only canonical no-repository failures", async () => {
   const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
   let failure: Error = new Error("spawn git ENOENT");
   const inspector = new GitRepositoryInspector(
@@ -326,17 +340,70 @@ test("git discovery distinguishes deleted roots, no-repo exits, and process fail
   assert.deepEqual(await inspector.validateRoot("/deleted/repo"), {
     kind: "not-repository",
   });
-  assert.deepEqual(await inspector.findRoot("/deleted/repo/new.ts"), {
-    kind: "indeterminate",
-    reason: "spawn git ENOENT",
-  });
 
-  failure = new ProcessExecutionError("not a repository", {
+  const indeterminateFailures = [
+    new ProcessExecutionError("missing git", { kind: "spawn" }),
+    new ProcessExecutionError("git timed out", { kind: "timeout" }),
+    new ProcessExecutionError("permission denied", {
+      kind: "exit",
+      exitCode: 128,
+      stderr: "fatal: cannot change to '/private/repo': Permission denied\n",
+    }),
+    new ProcessExecutionError("unsafe ownership", {
+      kind: "exit",
+      exitCode: 128,
+      stderr: "fatal: detected dubious ownership in repository at '/repo'\n",
+    }),
+    new ProcessExecutionError("bad config", {
+      kind: "exit",
+      exitCode: 128,
+      stderr: "fatal: bad config line 1 in file .git/config\n",
+    }),
+    new ProcessExecutionError("not a repository", {
+      kind: "exit",
+      exitCode: 128,
+      stderr: "fatal: loose object abc is corrupt\n",
+    }),
+  ];
+  for (const processFailure of indeterminateFailures) {
+    failure = processFailure;
+    assert.equal((await inspector.findRoot("/outside/new.ts")).kind, "indeterminate");
+  }
+
+  failure = new ProcessExecutionError("generic user-facing message", {
     kind: "exit",
     exitCode: 128,
+    stderr: "fatal: not a git repository (or any of the parent directories): .git\n",
   });
-  assert.deepEqual(await inspector.findRoot("/deleted/repo/new.ts"), {
+  assert.deepEqual(await inspector.findRoot("/outside/new.ts"), {
     kind: "not-repository",
+  });
+});
+
+test("git discovery keeps filesystem permission and realpath failures indeterminate", async () => {
+  const denied = Object.assign(new Error("permission denied"), { code: "EACCES" });
+  const permissionInspector = new GitRepositoryInspector(
+    { async run() { throw new Error("not reached"); } },
+    {
+      async stat() { throw denied; },
+      async realpath(value) { return value; },
+    },
+  );
+  assert.deepEqual(await permissionInspector.validateRoot("/private/repo"), {
+    kind: "indeterminate",
+    reason: "permission denied",
+  });
+
+  const realpathInspector = new GitRepositoryInspector(
+    { async run() { return { stdout: "/repo\n", stderr: "" }; } },
+    {
+      async stat() { return { isDirectory: () => true }; },
+      async realpath() { throw denied; },
+    },
+  );
+  assert.deepEqual(await realpathInspector.findRoot("/repo"), {
+    kind: "indeterminate",
+    reason: "permission denied",
   });
 });
 

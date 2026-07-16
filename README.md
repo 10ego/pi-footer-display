@@ -159,7 +159,7 @@ Network access occurs only through `gh` when a recognized `github.com` remote an
 - **Non-GitHub or unsupported remote:** uses the local directory name and branch with `!`; no PR lookup is attempted.
 - **Missing `gh`, unauthenticated `gh`, timeout, malformed response, or network failure:** keeps local Git context and adds `!`.
 - **Confirmed non-repository path:** unrelated automatic activity retains the last confirmed repository; a confirmed invalid restored pin may safely downgrade and fall back.
-- **Missing or timed-out `git`, permission/realpath/process failure, or unreadable local identity:** shows unavailable or stale context rather than claiming the path is not a repository. A restored pin and its persisted fields survive such transient startup failures.
+- **Missing or timed-out `git`, unsafe ownership, config/corruption, permission/realpath/process failure, or unreadable local identity:** shows unavailable or stale context rather than claiming the path is not a repository. Only Git's canonical no-repository diagnostic confirms an ordinary outside-repository path. A restored pin and its persisted fields survive such transient startup failures.
 - **Repository root found but metadata unreadable:** shows `repo — · !` for that repository context and never silently leaves a previous repository displayed as current.
 - **Ambiguous strongest-tier evidence:** shows the candidate count and `?`; use `pin` to choose explicitly.
 

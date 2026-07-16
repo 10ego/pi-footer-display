@@ -15,15 +15,22 @@ export type ProcessFailureKind = "exit" | "spawn" | "timeout" | "signal" | "proc
 export class ProcessExecutionError extends Error {
   readonly kind: ProcessFailureKind;
   readonly exitCode: number | undefined;
+  readonly stderr: string;
 
   constructor(
     message: string,
-    options: { readonly kind: ProcessFailureKind; readonly exitCode?: number; readonly cause?: unknown },
+    options: {
+      readonly kind: ProcessFailureKind;
+      readonly exitCode?: number;
+      readonly stderr?: string;
+      readonly cause?: unknown;
+    },
   ) {
     super(message, { cause: options.cause });
     this.name = "ProcessExecutionError";
     this.kind = options.kind;
     this.exitCode = options.exitCode;
+    this.stderr = options.stderr ?? "";
   }
 }
 
@@ -71,6 +78,7 @@ export class ExecFileRunner implements CommandRunner {
                 {
                   kind,
                   ...(typeof code === "number" ? { exitCode: code } : {}),
+                  stderr,
                   cause: error,
                 },
               ),

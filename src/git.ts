@@ -39,6 +39,18 @@ function isMissingPathError(error: unknown): boolean {
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
+function isGitNoRepositoryFailure(error: unknown): boolean {
+  if (
+    !(error instanceof ProcessExecutionError) ||
+    error.kind !== "exit" ||
+    error.exitCode !== 128
+  ) {
+    return false;
+  }
+  const firstLine = error.stderr.trimStart().split(/\r?\n/u, 1)[0]?.trimEnd();
+  return firstLine === "fatal: not a git repository (or any of the parent directories): .git";
+}
+
 /** Parses common HTTPS, SSH, SCP-like, and git GitHub remote URL forms. */
 export function parseGitHubRemote(remote: string): GitHubRepository | undefined {
   const value = remote.trim();
@@ -129,13 +141,7 @@ export class GitRepositoryInspector implements RepositoryInspector {
         "--show-toplevel",
       ]);
     } catch (error) {
-      if (
-        error instanceof ProcessExecutionError &&
-        error.kind === "exit" &&
-        error.exitCode === 128
-      ) {
-        return { kind: "not-repository" };
-      }
+      if (isGitNoRepositoryFailure(error)) return { kind: "not-repository" };
       return { kind: "indeterminate", reason: errorReason(error, "git lookup failed") };
     }
 
