@@ -4,6 +4,19 @@
   "description": "Add Git repository, branch, pull request, and session age context to Pi's native footer.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/10ego/pi-footer-display.git"
+  },
+  "homepage": "https://github.com/10ego/pi-footer-display#readme",
+  "bugs": {
+    "url": "https://github.com/10ego/pi-footer-display/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
   "engines": {
     "node": ">=22.19.0"
   },
@@ -14,7 +27,12 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && rm -rf .test-dist && tsc -p tsconfig.test.json && node --test .test-dist/tests/*.test.js && rm -rf .test-dist"
+    "test": "npm run typecheck && npm run test:unit && npm run test:tooling",
+    "test:unit": "node scripts/run-unit-tests.mjs",
+    "test:tooling": "node --test tests/tooling/compare-semver.test.mjs tests/tooling/package-contents.test.mjs tests/tooling/release-version.test.mjs tests/tooling/workflows.test.mjs",
+    "verify:release-version": "node scripts/verify-release-version.mjs",
+    "verify:package": "node scripts/verify-package-contents.mjs",
+    "verify:workflows": "node scripts/verify-workflows.mjs"
   },
   "keywords": [
     "pi-package",
