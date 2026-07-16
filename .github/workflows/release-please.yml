@@ -129,10 +129,12 @@ jobs:
             DIST_TAG=latest
           fi
 
-          echo "tag=$TARGET_TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "recovery=$RECOVERY" >> "$GITHUB_OUTPUT"
-          echo "dist-tag=$DIST_TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$TARGET_TAG"
+            echo "version=$VERSION"
+            echo "recovery=$RECOVERY"
+            echo "dist-tag=$DIST_TAG"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Verify recovery GitHub release
         if: ${{ steps.target.outputs.recovery == 'true' }}
