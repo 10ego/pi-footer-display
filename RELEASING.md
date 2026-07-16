@@ -153,7 +153,7 @@ gh workflow run .github/workflows/release-please.yml \
   -f tag=''
 ```
 
-An empty tag runs normal Release Please behavior. A non-empty tag selects recovery mode instead; do not use one merely to prompt a normal release scan.
+An empty tag runs normal Release Please behavior only when the dispatch ref is `main`. A normal dispatch from any other ref is skipped before App token creation or Release Please. A non-empty tag selects recovery mode instead; dispatch recovery from `main` as shown, but publication resolves and checks out the explicit tag rather than publishing the dispatch ref. Do not use a recovery tag merely to prompt a normal release scan.
 
 ## Normal release lifecycle
 
@@ -165,8 +165,9 @@ Once enabled, the normal lifecycle is:
 4. The workflow enables squash auto-merge on each created release PR. Repository rules hold the PR until `Validate PR title` and `Test` pass.
 5. Squash-merging the release PR pushes synchronized version/changelog metadata to `main` and triggers the workflow again.
 6. Release Please creates the exact `v<version>` tag and a GitHub release.
-7. The publish job checks out that exact tag without persisted credentials, fetches full history, installs dependencies, runs tests, verifies synchronized release metadata and package contents, verifies that the tag resolves to the checked-out commit, and rejects a tag commit that is not an ancestor of `origin/main`.
-8. If npm returns a structured `E404` response for the exact version, npm trusted publishing supplies short-lived OIDC credentials and the workflow publishes publicly with provenance. Stable versions explicitly use npm dist-tag `latest`; semantic-version prereleases use `next` so they cannot replace `latest`.
+7. The publish job takes only Release Please's documented `tag_name`, requires an exact `v`-prefixed SemVer tag, and derives the package version by stripping `v`. A missing or malformed normal-release tag fails; the workflow does not trust Release Please's undocumented version output.
+8. The publish job checks out that exact tag without persisted credentials, fetches full history, installs dependencies, runs tests, verifies synchronized release metadata and package contents, verifies that the tag resolves to the checked-out commit, and rejects a tag commit that is not an ancestor of `origin/main`.
+9. If npm returns a structured `E404` response for the exact version, the workflow selects `latest` for a stable version or `next` for a prerelease and queries `npm view pi-footer-display dist-tags.<tag> --json`. It compares versions by SemVer precedence and rejects a candidate lower than the current dist-tag; an unexpected equal result also fails closed. Only a structured package `E404` permits the no-dist-tag bootstrap case. npm trusted publishing then supplies short-lived OIDC credentials and publishes publicly with provenance.
 
 A normal run with no release created does not publish. A normal run finding its version already on npm fails rather than silently accepting a duplicate; investigate before retrying.
 
@@ -195,19 +196,19 @@ gh workflow run .github/workflows/release-please.yml \
   -f tag='v1.2.3'
 ```
 
-The input must be the complete tag, not a branch, SHA, version range, or unprefixed version. In recovery mode the release job skips. The publish job uses the read-only App token to verify that the named GitHub release exists and is not a draft, checks out the exact tag, derives the package version from it, and runs all normal verification before considering publication. The tag commit must be in `main` history, so even a non-draft release pointing to an arbitrary side-branch commit cannot publish.
+The input must be the complete tag, not a branch, SHA, version range, or unprefixed version. Dispatch from `main` as documented; in recovery mode the release job skips and the publish job remains bound to the explicit tag. The publish job uses the read-only App token to verify that the named GitHub release exists and is not a draft, strictly validates the exact `v`-prefixed SemVer tag before stripping `v` to derive the package version, checks out the exact tag, and runs all normal verification before considering publication. The tag commit must be in `main` history, so even a non-draft release pointing to an arbitrary side-branch commit cannot publish.
 
 npm duplicate handling is intentionally mode-specific:
 
 - **Recovery:** if the exact package version is already on npm, the run succeeds as a no-op (`should_publish=false`).
 - **Normal release:** if the exact package version is already on npm, the run fails to expose an unexpected duplicate.
-- **Either mode:** only npm `E404` means absent. Authentication, registry, network, and other lookup errors fail closed and do not publish.
+- **Either mode:** only a structured npm `E404` means the exact version is absent. Before publishing, the selected `latest` or `next` dist-tag is queried and a lower or unexpectedly equal candidate is rejected. A structured package `E404` is the only no-current-dist-tag bootstrap case; malformed output, a missing property on an existing package, authentication, registry, network, and other lookup errors fail closed.
 
 ## Troubleshooting
 
 ### Both release jobs are skipped
 
-Check repository variables. Both must equal exact lowercase `true`. For normal mode, the event must also be a push to `main` or a dispatch with an empty tag. For recovery, dispatch with a non-empty tag.
+Check repository variables. Both must equal exact lowercase `true`. For normal mode, the event must also be a push to `main` or a dispatch with an empty tag and `--ref main`; an empty-tag dispatch from another ref intentionally skips before App authentication. For recovery, dispatch from `main` with a non-empty exact tag; the publish job uses that tag rather than the dispatch ref.
 
 ```bash
 gh variable list --repo 10ego/pi-footer-display
@@ -247,15 +248,19 @@ Do not bypass a failing required check to force a release.
 
 Confirm the npm trusted publisher exactly names owner `10ego`, repository `pi-footer-display`, and workflow filename `release-please.yml`, with no unmatched environment restriction. The workflow deliberately has no npm token fallback. Keep the gate closed until OIDC configuration is corrected.
 
-### npm availability check fails
+### npm availability or dist-tag regression check fails
 
-Check the exact version manually:
+Check the exact version and selected dist-tag manually:
 
 ```bash
 npm view pi-footer-display@VERSION version --json
+npm view pi-footer-display dist-tags.latest --json  # stable candidate
+npm view pi-footer-display dist-tags.next --json    # prerelease candidate
 ```
 
-A structured npm JSON error with code `E404` means the version is absent. Any malformed response or other error is not proof of absence and the workflow correctly refuses to publish. If a normal run reports a duplicate, verify the npm artifact and GitHub release before choosing recovery; do not change or reuse the tag.
+A structured npm JSON error with code `E404` means the queried package/version is absent. For the dist-tag lookup, only a structured package `E404` is accepted as the bootstrap case with no current tag. Malformed JSON, an empty or non-string dist-tag response, authentication failure, registry failure, and network failure are not proof of absence and correctly stop publication.
+
+If the candidate is lower than the current `latest` or `next` version by SemVer precedence, publish a new version greater than that dist-tag; never move the tag backward. Equality after the exact-version absence check indicates inconsistent or racing npm state and fails closed. If a normal run reports a duplicate, verify the npm artifact and GitHub release before choosing recovery; do not change or reuse the tag.
 
 ### Recovery rejects the tag or release
 

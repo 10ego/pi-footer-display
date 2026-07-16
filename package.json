@@ -29,7 +29,7 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck && npm run test:unit && npm run test:tooling",
     "test:unit": "node scripts/run-unit-tests.mjs",
-    "test:tooling": "node --test tests/tooling/package-contents.test.mjs tests/tooling/release-version.test.mjs tests/tooling/workflows.test.mjs",
+    "test:tooling": "node --test tests/tooling/compare-semver.test.mjs tests/tooling/package-contents.test.mjs tests/tooling/release-version.test.mjs tests/tooling/workflows.test.mjs",
     "verify:release-version": "node scripts/verify-release-version.mjs",
     "verify:package": "node scripts/verify-package-contents.mjs",
     "verify:workflows": "node scripts/verify-workflows.mjs"

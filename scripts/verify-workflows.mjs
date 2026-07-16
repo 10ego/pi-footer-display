@@ -9,7 +9,8 @@ const ACTION_PINS = Object.freeze({
   "googleapis/release-please-action": "5c625bfb5d1ff62eadeeb3772007f7f66fdcf071",
 });
 
-const RELEASE_GATE = "if: ${{ vars.RELEASE_AUTOMATION_ENABLED == 'true' && vars.NPM_TRUSTED_PUBLISHING_READY == 'true' && (github.event_name == 'push' || inputs.tag == '') }}";
+const RELEASE_GATE = "if: ${{ vars.RELEASE_AUTOMATION_ENABLED == 'true' && vars.NPM_TRUSTED_PUBLISHING_READY == 'true' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.tag == '' && github.ref == 'refs/heads/main')) }}";
+const TAG_SEMVER_PATTERN = "SEMVER_PATTERN='^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$'";
 const PUBLISH_GATE = "if: ${{ always() && vars.RELEASE_AUTOMATION_ENABLED == 'true' && vars.NPM_TRUSTED_PUBLISHING_READY == 'true' && ((needs.release.result == 'success' && needs.release.outputs.release_created == 'true') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')) }}";
 
 function invariant(condition, message) {
@@ -91,11 +92,21 @@ export function verifyWorkflowSources({ pullRequest, release, packageJson }) {
   invariant(!/(secrets\.GITHUB_TOKEN|github\.token|\bNPM_TOKEN\b)/.test(`${pullRequest}\n${release}`), "GITHUB_TOKEN fallback and NPM_TOKEN are forbidden");
   includes(release, "config-file: release-please-config.json", "Release Please config is required");
   includes(release, "manifest-file: .release-please-manifest.json", "Release Please manifest is required");
-  for (const output of ["release_created", "version", "tag_name"]) {
-    includes(release, "      " + output + ": ${{ steps.release.outputs." + output + " }}", `release job must expose ${output}`);
-  }
+  const releaseOutputs = release.match(/    outputs:\n((?:      [^\n]+\n?)+)/)?.[1] ?? "";
+  invariant(
+    releaseOutputs === "      release_created: ${{ steps.release.outputs.release_created }}\n      tag_name: ${{ steps.release.outputs.tag_name }}\n",
+    "release job must expose only documented release_created and tag_name outputs",
+  );
+  invariant(!/(?:steps\.release|needs\.release)\.outputs\.version/.test(release), "release version must never depend on the undocumented Release Please version output");
   includes(release, 'gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --auto --squash', "release PRs must enable squash auto-merge");
 
+  includes(release, "RELEASE_TAG: ${{ needs.release.outputs.tag_name }}", "normal publish must use the documented Release Please tag_name output");
+  includes(release, 'if [[ -z "$TARGET_TAG" ]]; then\n              echo "Release Please did not emit a tag" >&2\n              exit 1\n            fi', "normal publish must fail when Release Please emits no tag");
+  includes(release, TAG_SEMVER_PATTERN, "all release tags must be exact v-prefixed semantic versions");
+  includes(release, 'if [[ ! "$TARGET_TAG" =~ $SEMVER_PATTERN ]]; then\n            echo "Release tag must be an exact v-prefixed semantic version: $TARGET_TAG" >&2\n            exit 1\n          fi', "malformed normal and recovery tags must fail before version derivation");
+  const tagValidation = release.indexOf('if [[ ! "$TARGET_TAG" =~ $SEMVER_PATTERN ]]');
+  const versionDerivation = release.indexOf('VERSION="${TARGET_TAG#v}"');
+  invariant(tagValidation !== -1 && versionDerivation > tagValidation, "version must be derived only after strict validation by stripping v from the release tag");
   includes(release, "ref: ${{ steps.target.outputs.tag }}", "publish must check out the exact emitted or recovery tag");
   includes(release, "fetch-depth: 0", "release checkout must fetch main history for ancestry verification");
   includes(release, "persist-credentials: false", "release checkout must not persist credentials");
@@ -116,7 +127,11 @@ export function verifyWorkflowSources({ pullRequest, release, packageJson }) {
   includes(release, 'npm view "$PACKAGE_NAME@$VERSION" version --json', "publish must query npm before publishing");
   includes(release, 'if [[ "$RECOVERY" == "true" ]]; then', "an existing package must make recovery a no-op");
   includes(release, "refusing duplicate normal publish", "normal mode must fail on an existing package version");
-  includes(release, 'payload?.error?.code !== "E404"', "only a structured npm E404 response may be treated as absent");
+  invariant(occurrences(release, /payload\?\.error\?\.code !== "E404"/g) === 2, "only structured npm E404 responses may be treated as absent");
+  includes(release, 'npm view "$PACKAGE_NAME" "dist-tags.$DIST_TAG" --json', "latest and next must each query their current npm dist-tag");
+  includes(release, 'node scripts/compare-semver.mjs "$VERSION" "$CURRENT_VERSION"', "dist-tag versions must use the deterministic SemVer comparator");
+  includes(release, '-1)\n                echo "$VERSION is lower than current $DIST_TAG version $CURRENT_VERSION; refusing dist-tag regression." >&2\n                exit 1', "lower versions must not regress latest or next");
+  includes(release, '0)\n                echo "$VERSION equals current $DIST_TAG version $CURRENT_VERSION after the exact-version absence check; refusing inconsistent npm state." >&2\n                exit 1', "equal dist-tag versions must fail closed");
   includes(release, "latest|next", "publish must reject unexpected npm dist-tags");
   invariant(occurrences(release, /^\s*npm publish --access public --provenance --tag "\$DIST_TAG"$/gm) === 1, "publish command must include provenance and the validated dist-tag exactly once");
 
@@ -127,6 +142,7 @@ export function verifyWorkflowSources({ pullRequest, release, packageJson }) {
   invariant(packageJson.publishConfig?.provenance === true, "package.json must enable publishConfig.provenance");
   invariant(packageJson.scripts?.["verify:workflows"] === "node scripts/verify-workflows.mjs", "verify:workflows script must run the static verifier");
   invariant(packageJson.scripts?.["test:tooling"]?.includes("tests/tooling/workflows.test.mjs"), "workflow tests must be wired into test:tooling");
+  invariant(packageJson.scripts?.["test:tooling"]?.includes("tests/tooling/compare-semver.test.mjs"), "SemVer comparator tests must be wired into test:tooling");
 }
 
 export function verifyWorkflows(rootDir = process.cwd()) {
