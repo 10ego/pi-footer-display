@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, test } from "node:test";
 import {
   assertPackageContents,
@@ -9,7 +11,7 @@ import {
 } from "../../scripts/verify-package-contents.mjs";
 
 function files(paths = REQUIRED_PACKAGE_FILES) {
-  return paths.map((filePath) => ({ path: filePath }));
+  return paths.map((filePath) => ({ path: filePath, size: 1, mode: 0o644 }));
 }
 
 describe("npm package contents", () => {
@@ -44,15 +46,22 @@ describe("npm package contents", () => {
   ]) {
     test(`rejects leaked path ${forbiddenPath}`, () => {
       assert.throws(
-        () => assertPackageContents([...files(), { path: forbiddenPath }]),
-        /forbidden build, test, CI, or local paths/,
+        () => assertPackageContents([...files(), { path: forbiddenPath, size: 1, mode: 0o644 }]),
+        /forbidden build, test, CI, or local paths|unsafe path|unsupported file type/,
       );
     });
   }
 
   test("rejects files outside the exact audited allowlist and duplicate paths", () => {
-    assert.throws(() => assertPackageContents([...files(), { path: "src/unreviewed.ts" }]), /outside the audited allowlist/);
-    assert.throws(() => assertPackageContents([...files(), { path: REQUIRED_PACKAGE_FILES[0] }]), /duplicate file paths/);
+    assert.throws(() => assertPackageContents([...files(), { path: "src/unreviewed.ts", size: 1, mode: 0o644 }]), /outside the audited allowlist/);
+    assert.throws(() => assertPackageContents([...files(), files()[0]]), /duplicate file paths/);
+  });
+
+  test("rejects executable, oversized, and unsupported package files", () => {
+    const current = files();
+    assert.throws(() => assertPackageContents(current.map((file, index) => index === 0 ? { ...file, mode: 0o755 } : file)), /unsafe file mode/);
+    assert.throws(() => assertPackageContents(current.map((file, index) => index === 0 ? { ...file, size: 6 * 1024 * 1024 } : file)), /file size metadata/);
+    assert.throws(() => assertPackageContents([...current, { path: "src/payload.sh", size: 1, mode: 0o644 }]), /unsupported file type/);
   });
 
   test("rejects malformed npm pack file records", () => {
@@ -76,6 +85,25 @@ describe("npm package contents", () => {
     assert.throws(() => assertPackageMetadata(packageJson, localRepository, result.paths.length), /repository URL/);
     const noProvenance = { ...manifest, publishConfig: { ...manifest.publishConfig, provenance: false } };
     assert.throws(() => assertPackageMetadata(packageJson, noProvenance, result.paths.length), /provenance/);
+    const lifecycle = { ...manifest, scripts: { ...manifest.scripts, prepack: "node payload.js" } };
+    assert.throws(() => assertPackageMetadata(packageJson, lifecycle, result.paths.length), /lifecycle script is forbidden/);
+  });
+
+  test("package inspection never runs lifecycle scripts", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-footer-package-policy-"));
+    try {
+      fs.writeFileSync(path.join(directory, "README.md"), "probe\n");
+      fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify({
+        name: "pi-footer-display",
+        version: "1.0.0",
+        files: ["README.md"],
+        scripts: { prepack: "node -e \"require('node:fs').writeFileSync('lifecycle-ran', 'yes')\"" },
+      }));
+      assert.throws(() => verifyPackageContents(directory), /Package metadata invariant failed|Package is missing required files/);
+      assert.equal(fs.existsSync(path.join(directory, "lifecycle-ran")), false);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
 

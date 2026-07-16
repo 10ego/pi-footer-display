@@ -1,280 +1,196 @@
-# Releasing
+# Release operations
 
-This document is the operator runbook for bootstrapping, enabling, operating, disabling, and recovering the release pipeline. Do not put npm credentials, GitHub App private keys, or other credentials in this repository.
+This runbook covers activation, normal operation, recovery, and emergency shutdown for the `pi-footer-display` npm release pipeline. GitHub tags, GitHub releases, workflow artifacts, and npm versions are immutable release records; never move, reuse, or replace them.
 
-## Current fail-closed status
+## Published bootstrap record
 
-As of this release-automation rollout, the target repository has no release variables, no `NERV_OPS_PRIVATE_KEY` Actions secret, no configured npm trusted publisher, and no published `pi-footer-display` npm package. The npm registry returns `E404` for the package.
-
-Both jobs in `.github/workflows/release-please.yml` require these repository variables to equal the exact lowercase string `true`:
-
-- `NPM_TRUSTED_PUBLISHING_READY`
-- `RELEASE_AUTOMATION_ENABLED`
-
-While either gate is absent or has any other value, both `Create release PR or GitHub release` and `Verify and publish to npm` skip. The pull-request workflow is independent of those gates: PR title validation and the `Test` job work while release automation is disabled.
-
-**Do not set either gate to `true` before its prerequisite is complete. Set `RELEASE_AUTOMATION_ENABLED=true` only in the final activation step.**
-
-## Release baseline
-
-Release Please uses bootstrap commit:
+The bootstrap is complete. `pi-footer-display@0.1.0` is already published from this exact source commit:
 
 ```text
 147470b11439248d54b011a011663254709c36c3
 ```
 
-The current release baseline is synchronized at `0.1.0` in all four locations checked by `npm run verify:release-version`:
+The audited tarball produced from that commit and the tarball served by npm were compared byte-for-byte and verified byte-identical. The registry tarball has these recorded values:
 
-- `package.json` → `version`
-- `package-lock.json` → top-level `version`
-- `package-lock.json` → `packages[""].version`
-- `.release-please-manifest.json` → `"."`
+- SHA-512 (hex): `5e0bd3d26883578ef02d6ca47be4842bb355f9e049b073b8041c7ee1d22374fdf2deb96d806e2470d2ceb37ab84ba8848b686e86671db7239bcf4f71f35cf6e8`
+- npm-reported `dist.shasum`: `dc4db8031d3562c61a6e129fa21fd37bde7d544c`
+- npm-reported `dist.integrity`: `sha512-XgvT0miDV47wLWyke+SEK7NV+eBJsHO4BBx+4dIjdP3y3rltgG4kcNLOs3q4S6iEi2huhmcdtyObz09x81z26A==`
 
-The bootstrap commit itself also has `0.1.0` in `package.json` and both lockfile locations. The one-time bootstrap publish must use an audited tarball built from that exact commit. npm versions are immutable; never repack a changed tree and try to reuse `0.1.0`.
-
-## One-time activation order
-
-Perform these steps in exactly this order. Steps involving GitHub or npm settings require an authorized repository/package administrator.
-
-### 1. Merge the release-automation PR while gates are absent
-
-Confirm that the release variables and App secret are still absent. Merge this PR with **squash** and a non-releasing `chore(ci)` title, for example:
-
-```text
-chore(ci): add gated release automation
-```
-
-Do not use a `feat`, `fix`, or other release-triggering squash title for this bootstrap merge. Do not enable a release gate before the merge.
-
-### 2. Configure repository merge policy
-
-In the GitHub repository settings:
-
-1. Enable repository auto-merge.
-2. Allow squash merging and use squash for this repository's release PRs.
-3. Configure the applicable `main` rules to require a pull request and the exact PR checks `Validate PR title` and `Test` before merge.
-4. Verify that a passing PR can become mergeable under those rules.
-
-The workflow calls `gh pr merge --auto --squash`; repository auto-merge, squash support, and compatible branch rules must therefore exist before automation is enabled.
-
-### 3. Install and configure the `nerv-ops` GitHub App
-
-Install `nerv-ops` on `10ego/pi-footer-display`, limiting repository access to this repository if possible. Supplying an App ID and private key is not sufficient: `actions/create-github-app-token` can issue a repository-scoped installation token only when the App has an active installation with access to this repository. The installation's repository permissions must permit the operations required by pinned Release Please v4.4.1:
-
-- **Contents: read and write** — create/update the release branch, commit release metadata, and create tags and GitHub releases.
-- **Issues: read and write** — maintain Release Please's release-tracking labels and issue metadata.
-- **Pull requests: read and write** — create/update the Release Please PR and enable squash auto-merge.
-- **Metadata: read-only** — GitHub's required baseline App permission.
-
-Do not grant unrelated permissions. Confirm that the installation is active for this repository and that App-authored pull requests run the required PR checks.
-
-### 4. Add the App variable and secret
-
-Add these repository-level Actions values:
-
-- Variable `NERV_OPS_APP_ID`: the numeric App ID.
-- Secret `NERV_OPS_PRIVATE_KEY`: the App private key in PEM form.
-
-The workflow exchanges them for short-lived installation tokens and narrows each token at creation time: release automation requests only Contents write, Issues write, and Pull requests write, while recovery verification requests only Contents read. Keep the private key only in the authorized secret store: do not save it in a tracked file, shell transcript, package tarball, issue, or pull request.
-
-Leave `NPM_TRUSTED_PUBLISHING_READY` and `RELEASE_AUTOMATION_ENABLED` absent or not `true`.
-
-### 5. Audit and manually publish the bootstrap `0.1.0` tarball once
-
-Trusted publishing is configured on an existing npm package, so an authorized npm owner must establish `pi-footer-display@0.1.0` first. Use a clean detached worktree at the exact bootstrap SHA, audit it, build one tarball, and publish that same immutable file.
-
-The following local preparation commands do not authenticate or publish:
+The npm values can be re-read without authenticating:
 
 ```bash
-BOOTSTRAP=147470b11439248d54b011a011663254709c36c3
-git cat-file -e "$BOOTSTRAP^{commit}"
-git worktree add --detach ../pi-footer-display-bootstrap-0.1.0 "$BOOTSTRAP"
-cd ../pi-footer-display-bootstrap-0.1.0
-test "$(git rev-parse HEAD)" = "$BOOTSTRAP"
-npm ci
-npm test
-node -e 'const p=require("./package.json"); const l=require("./package-lock.json"); if (p.version!=="0.1.0" || l.version!=="0.1.0" || l.packages[""].version!=="0.1.0") process.exit(1)'
-npm pack --dry-run
-npm pack --json | tee npm-pack.json
-shasum -a 512 pi-footer-display-0.1.0.tgz
-tar -tzf pi-footer-display-0.1.0.tgz
+npm view pi-footer-display@0.1.0 version dist.shasum dist.integrity --json
 ```
 
-Review the source, dry-run output, tar member list, generated metadata, and checksum before proceeding. Authenticate with npm only through the authorized operator's normal out-of-repository credential mechanism. No npm token, `.npmrc`, or other credential belongs in this repository.
+The integrity value decodes to the recorded SHA-512. npm versions are immutable: **do not rebuild, republish, deprecate as a substitute for replacement, or otherwise repeat a bootstrap publish for `0.1.0`**. A checksum mismatch is a security incident to investigate, not a reason to publish another `0.1.0` tarball.
 
-After confirming `npm whoami` identifies the authorized owner and the package is still absent, the authorized operator performs the one-time publish of the already-audited file:
+The Release Please baseline remains synchronized at `0.1.0` in `package.json`, both lockfile version locations, and `.release-please-manifest.json`. `release-please-config.json` intentionally retains the exact bootstrap commit above as `bootstrap-sha`.
+
+## Security boundaries
+
+`.github/workflows/release-please.yml` denies permissions by default and uses four jobs:
+
+| Job | Environment | Permissions | Purpose |
+| --- | --- | --- | --- |
+| `release` | `release-automation` | `contents: read` for `github.token` | Reads the environment-scoped App key, creates a short-lived repository installation token, and runs Release Please. |
+| `validate` | none | `contents: read` | Checks the exact tag and `main` ancestry before running source, installs dependencies with lifecycle scripts disabled, and runs all tests and audits. |
+| `package` | none | `contents: read` | Uses a fresh runner and exact tag checkout. It installs nothing and runs no repository script; it creates one `npm pack --ignore-scripts` tarball and uploads it by unique artifact ID. |
+| `publish` | `npm-publish` | `actions: read`, `id-token: write` | Checks out no source, runs no repository code, verifies the exact current-run tarball, rechecks npm state, and publishes through OIDC. |
+
+The App private key and npm OIDC permission never coexist with dependency or project execution. The publish job accepts only the artifact ID and digests emitted by the fresh package job, and it independently checks the archive paths, package metadata, Pi entry points, lifecycle-script policy, package version, and SHA-256.
+
+All jobs require these repository variables to equal the exact lowercase value `true`:
+
+- `NPM_TRUSTED_PUBLISHING_READY`
+- `RELEASE_AUTOMATION_ENABLED`
+
+An absent or different value closes the gate. Keep both variables absent throughout rollout.
+
+## One-time activation
+
+### 1. Protect GitHub environments
+
+Create both environments with selected deployment branches restricted to branch `main` only. Tags and unrestricted deployment policies are not allowed.
+
+For `release-automation`:
+
+- Store `NERV_OPS_PRIVATE_KEY` only as an environment secret.
+- Store the App Client ID as the repository variable `NERV_OPS_CLIENT_ID`. The Client ID is an identifier, not a secret.
+- Do not configure an approval gate that could block routine Release Please operation.
+
+For `npm-publish`:
+
+- Store no secrets.
+- Use the environment name as part of the npm trusted-publisher identity.
+- With the current single-operator model, do not enable prevent-self-review or required reviewers. Add an independent reviewer and backup only when those people actually exist.
+
+### 2. Scope the GitHub App
+
+The private `nerv-ops` App should be installed only on intended repositories and have only:
+
+- Contents: read and write
+- Pull requests: read and write
+- Metadata: read-only, required by GitHub
+
+Do not grant Actions, Administration, Environments, Secrets, or Workflows permissions. Do not allow the App to bypass `main` protection. The workflow omits `owner` and `repositories` when creating the token, so the resulting installation token is scoped to the current repository.
+
+Upload the existing active App private key without putting it in a shell argument or repository file:
 
 ```bash
-npm view pi-footer-display@0.1.0 version --json  # must return E404 before first publish
-npm publish ./pi-footer-display-0.1.0.tgz --access public
-npm view pi-footer-display@0.1.0 version --json  # must return "0.1.0"
-```
-
-Do not run the publish command if `0.1.0` already exists. Preserve the audit record outside the repository, then remove the temporary worktree and local tarball when retention requirements allow.
-
-### 6. Configure npm trusted publishing
-
-For the npm package `pi-footer-display`, add a GitHub Actions trusted publisher with these exact coordinates:
-
-- GitHub organization or user: `10ego`
-- Repository: `pi-footer-display`
-- Workflow filename: `release-please.yml` (the tracked file is `.github/workflows/release-please.yml`)
-
-npm's trusted-publisher field takes the filename, not the repository-relative path. Do not configure an environment unless the workflow is changed to use that exact environment. The workflow requests `id-token: write`, installs npm `11.5.1`, and publishes with provenance plus an explicit safe dist-tag (`latest` for stable versions or `next` for prereleases); it does not read `NPM_TOKEN`.
-
-### 7. Mark trusted publishing ready
-
-Only after the publisher coordinates have been saved and verified, set the repository variable:
-
-```text
-NPM_TRUSTED_PUBLISHING_READY=true
-```
-
-Keep `RELEASE_AUTOMATION_ENABLED` absent or not `true` while checking all earlier prerequisites.
-
-### 8. Enable release automation last
-
-After repository rules, App installation, App values, bootstrap publication, and npm trusted publishing are all verified, set this repository variable last:
-
-```text
-RELEASE_AUTOMATION_ENABLED=true
-```
-
-Both values are case-sensitive; only the exact string `true` opens the gates.
-
-### 9. Start or await the normal workflow
-
-Either wait for the next push to `main`, or dispatch the workflow with an empty `tag` input:
-
-```bash
-gh workflow run .github/workflows/release-please.yml \
+gh secret set NERV_OPS_PRIVATE_KEY \
   --repo 10ego/pi-footer-display \
-  --ref main \
-  -f tag=''
+  --env release-automation \
+  < /secure/path/to/nerv-ops-private-key.pem
 ```
 
-An empty tag runs normal Release Please behavior only when the dispatch ref is `main`. A normal dispatch from any other ref is skipped before App token creation or Release Please. A non-empty tag selects recovery mode instead; dispatch recovery from `main` as shown, but publication resolves and checks out the explicit tag rather than publishing the dispatch ref. Do not use a recovery tag merely to prompt a normal release scan.
+After the environment secret is confirmed and release authentication is validated, delete any repository-level secret with the same name. Do not rotate or revoke the still-active key solely for this migration.
 
-## Normal release lifecycle
+### 3. Bind npm trusted publishing
 
-Once enabled, the normal lifecycle is:
+In the npm settings for `pi-footer-display`, configure the GitHub Actions trusted publisher with exactly:
 
-1. Conventional Commit squash titles land on `main`.
-2. A push to `main` runs `.github/workflows/release-please.yml`.
-3. Release Please uses the `nerv-ops` installation token, `release-please-config.json`, and `.release-please-manifest.json` to create or update its release PR.
-4. The workflow enables squash auto-merge on each created release PR. Repository rules hold the PR until `Validate PR title` and `Test` pass.
-5. Squash-merging the release PR pushes synchronized version/changelog metadata to `main` and triggers the workflow again.
-6. Release Please creates the exact `v<version>` tag and a GitHub release.
-7. The publish job takes only Release Please's documented `tag_name`, requires an exact `v`-prefixed SemVer tag, and derives the package version by stripping `v`. A missing or malformed normal-release tag fails; the workflow does not trust Release Please's undocumented version output.
-8. The publish job checks out that exact tag without persisted credentials, fetches full history, installs dependencies, runs tests, verifies synchronized release metadata and package contents, verifies that the tag resolves to the checked-out commit, and rejects a tag commit that is not an ancestor of `origin/main`.
-9. If npm returns a structured `E404` response for the exact version, the workflow selects `latest` for a stable version or `next` for a prerelease and queries `npm view pi-footer-display dist-tags.<tag> --json`. It compares versions by SemVer precedence and rejects a candidate lower than the current dist-tag; an unexpected equal result also fails closed. Only a structured package `E404` permits the no-dist-tag bootstrap case. npm trusted publishing then supplies short-lived OIDC credentials and publishes publicly with provenance.
+```text
+Owner:       10ego
+Repository:  pi-footer-display
+Workflow:    release-please.yml
+Environment: npm-publish
+```
 
-A normal run with no release created does not publish. A normal run finding its version already on npm fails rather than silently accepting a duplicate; investigate before retrying.
+Do not configure `NPM_TOKEN` or another token fallback. Keep npm account 2FA enabled and remove unused automation tokens.
 
-## Disable or pause automation
+### 4. Protect release tags
 
-Set `RELEASE_AUTOMATION_ENABLED` to `false` (or remove it) to stop both release jobs. Because both jobs require both gates, setting `NPM_TRUSTED_PUBLISHING_READY` to `false` also stops them when trusted publishing is unavailable.
+Protect tags matching `v*` against updates and deletion, and enable immutable GitHub releases when available. Release Please must be able to create a new tag, but neither operators nor the App should be able to move an existing release tag.
 
-Use the automation gate for a general pause and the trusted-publishing gate to record npm readiness accurately. A gate change does not cancel a job that has already started; cancel or inspect an in-progress run separately if necessary. Restore prerequisites first, then set `NPM_TRUSTED_PUBLISHING_READY=true` and `RELEASE_AUTOMATION_ENABLED=true` last.
+### 5. Verify configuration before opening gates
 
-PR CI remains active while release gates are disabled.
-
-## Recovery publish
-
-Recovery is only for an existing, non-draft GitHub release whose npm publish did not complete. Both release gates must still be exactly `true`.
-
-Dispatch with an explicit, exact, `v`-prefixed semantic-version tag, for example:
+Use name-only checks; never print the private key:
 
 ```bash
-gh release view v1.2.3 \
+gh secret list --repo 10ego/pi-footer-display
+gh secret list --repo 10ego/pi-footer-display --env release-automation
+gh secret list --repo 10ego/pi-footer-display --env npm-publish
+gh api repos/10ego/pi-footer-display/environments/release-automation
+gh api repos/10ego/pi-footer-display/environments/npm-publish
+npm view pi-footer-display version dist-tags --json
+```
+
+Confirm:
+
+- `main` still requires `Validate PR title` and `Test`, including for administrators.
+- Both environments admit only `main`.
+- The App key appears only in `release-automation`.
+- `npm-publish` contains no secrets.
+- npm names the exact workflow and `npm-publish` environment.
+- Every workflow action is pinned to an approved full commit SHA.
+- `npm test`, `npm run verify:release-version`, `npm run verify:package`, `npm run verify:workflows`, and Actionlint pass on `main`.
+
+### 6. Open gates in order
+
+Set npm readiness first:
+
+```bash
+gh variable set NPM_TRUSTED_PUBLISHING_READY \
+  --repo 10ego/pi-footer-display \
+  --body true
+```
+
+After one final configuration review, enable automation:
+
+```bash
+gh variable set RELEASE_AUTOMATION_ENABLED \
+  --repo 10ego/pi-footer-display \
+  --body true
+```
+
+A variable change does not cancel a workflow already running. Cancel unsafe or stale runs separately.
+
+## Normal releases
+
+1. A conventional squash commit lands on `main`.
+2. `release` enters `release-automation`, creates a one-hour repository-scoped App token, and creates or updates the Release Please PR.
+3. Required checks hold the release PR until it is safe to auto-merge with squash.
+4. The release PR merge synchronizes the root package, both root lockfile version fields, changelog, and manifest.
+5. A subsequent Release Please run creates the exact `v<version>` tag and non-draft GitHub release.
+6. `validate` verifies the tag before running code, tests the release, and checks npm availability.
+7. `package` creates and uploads one fresh lifecycle-script-disabled tarball.
+8. `publish` verifies the current-run artifact, rechecks that the exact version is absent and the selected dist-tag advances, then publishes with npm provenance.
+
+Stable versions explicitly update `latest`; prereleases explicitly update `next`. A normal run fails if the exact npm version already exists.
+
+## Recovery publication
+
+Recovery is only for an existing non-draft GitHub release whose npm publication did not complete. Inspect the release and dispatch from `main`:
+
+```bash
+gh release view v0.2.0 \
   --repo 10ego/pi-footer-display \
   --json tagName,isDraft,targetCommitish
 
 gh workflow run .github/workflows/release-please.yml \
   --repo 10ego/pi-footer-display \
   --ref main \
-  -f tag='v1.2.3'
+  -f tag=v0.2.0
 ```
 
-The input must be the complete tag, not a branch, SHA, version range, or unprefixed version. Dispatch from `main` as documented; in recovery mode the release job skips and the publish job remains bound to the explicit tag. The publish job uses the read-only App token to verify that the named GitHub release exists and is not a draft, strictly validates the exact `v`-prefixed SemVer tag before stripping `v` to derive the package version, checks out the exact tag, and runs all normal verification before considering publication. The tag commit must be in `main` history, so even a non-draft release pointing to an arbitrary side-branch commit cannot publish.
+Recovery skips the App-key environment, verifies the release with read-only `github.token`, and performs all normal validation, packaging, and publication checks. If npm already contains the exact version, recovery succeeds as a no-op.
 
-npm duplicate handling is intentionally mode-specific:
+Never recover by moving a tag, drafting a replacement release, rebuilding an existing npm version, or uploading a manually repacked artifact.
 
-- **Recovery:** if the exact package version is already on npm, the run succeeds as a no-op (`should_publish=false`).
-- **Normal release:** if the exact package version is already on npm, the run fails to expose an unexpected duplicate.
-- **Either mode:** only a structured npm `E404` means the exact version is absent. Before publishing, the selected `latest` or `next` dist-tag is queried and a lower or unexpectedly equal candidate is rejected. A structured package `E404` is the only no-current-dist-tag bootstrap case; malformed output, a missing property on an existing package, authentication, registry, network, and other lookup errors fail closed.
+## Emergency shutdown
 
-## Troubleshooting
-
-### Both release jobs are skipped
-
-Check repository variables. Both must equal exact lowercase `true`. For normal mode, the event must also be a push to `main` or a dispatch with an empty tag and `--ref main`; an empty-tag dispatch from another ref intentionally skips before App authentication. For recovery, dispatch from `main` with a non-empty exact tag; the publish job uses that tag rather than the dispatch ref.
+Close automation immediately by deleting or changing `RELEASE_AUTOMATION_ENABLED`:
 
 ```bash
-gh variable list --repo 10ego/pi-footer-display
-gh run list --repo 10ego/pi-footer-display --workflow release-please.yml --limit 10
+gh variable delete RELEASE_AUTOMATION_ENABLED --repo 10ego/pi-footer-display
 ```
 
-Do not open the gates simply to diagnose missing prerequisites.
+Close `NPM_TRUSTED_PUBLISHING_READY` as well if npm OIDC or the trusted-publisher identity is suspect. Cancel active workflow runs and revoke the App key if GitHub credentials may be exposed. Restore npm readiness first and release automation last only after all prerequisites are revalidated.
 
-### App token creation fails
+## Maintenance
 
-Verify that `NERV_OPS_APP_ID` is the numeric ID, `NERV_OPS_PRIVATE_KEY` contains the complete matching PEM key, and the `nerv-ops` App has an active installation with access to this repository. Then verify Contents, Issues, and Pull requests read/write permissions. Rotate a suspected private key in GitHub and the secret store; never commit it.
-
-### The release PR is not created or updated
-
-Inspect the Release Please step and confirm the App can write contents and pull requests. Verify the bootstrap SHA and manifest:
-
-```bash
-git cat-file -e 147470b11439248d54b011a011663254709c36c3^{commit}
-npm run verify:release-version
-```
-
-A history rewrite that removes the bootstrap commit or inconsistent version metadata must be resolved before retrying.
-
-### The release PR does not auto-merge
-
-Confirm repository auto-merge is enabled, squash merges are allowed, and the `main` rules require the exact checks `Validate PR title` and `Test`. Inspect the PR checks and auto-merge method:
-
-```bash
-gh pr checks PR_NUMBER --repo 10ego/pi-footer-display
-gh pr view PR_NUMBER --repo 10ego/pi-footer-display \
-  --json autoMergeRequest,mergeStateStatus,statusCheckRollup
-```
-
-Do not bypass a failing required check to force a release.
-
-### The publish job cannot obtain npm credentials
-
-Confirm the npm trusted publisher exactly names owner `10ego`, repository `pi-footer-display`, and workflow filename `release-please.yml`, with no unmatched environment restriction. The workflow deliberately has no npm token fallback. Keep the gate closed until OIDC configuration is corrected.
-
-### npm availability or dist-tag regression check fails
-
-Check the exact version and selected dist-tag manually:
-
-```bash
-npm view pi-footer-display@VERSION version --json
-npm view pi-footer-display dist-tags.latest --json  # stable candidate
-npm view pi-footer-display dist-tags.next --json    # prerelease candidate
-```
-
-A structured npm JSON error with code `E404` means the queried package/version is absent. For the dist-tag lookup, only a structured package `E404` is accepted as the bootstrap case with no current tag. Malformed JSON, an empty or non-string dist-tag response, authentication failure, registry failure, and network failure are not proof of absence and correctly stop publication.
-
-If the candidate is lower than the current `latest` or `next` version by SemVer precedence, publish a new version greater than that dist-tag; never move the tag backward. Equality after the exact-version absence check indicates inconsistent or racing npm state and fails closed. If a normal run reports a duplicate, verify the npm artifact and GitHub release before choosing recovery; do not change or reuse the tag.
-
-### Recovery rejects the tag or release
-
-Use an exact tag such as `v1.2.3` and verify that a non-draft GitHub release already exists for exactly that tag. Recovery does not create releases, accept draft releases, or accept arbitrary commits. The checked-out tag must resolve to the commit being verified, and that commit must be an ancestor of `origin/main`.
-
-### Tests or package inspection fail at the tag
-
-Reproduce from a clean checkout of the exact tag:
-
-```bash
-npm ci
-npm test
-npm run verify:release-version -- --expected VERSION
-npm run verify:package
-```
-
-Do not publish from a different checkout. Correct the release through a new immutable version rather than moving an existing tag or replacing an npm artifact.
+- Update pinned Actions through reviewed pull requests and update the workflow policy allowlist in the same change.
+- Run package inspection only with `--ignore-scripts`.
+- Add no package install, pack, prepare, or publish lifecycle scripts without a new security review.
+- Update the package file policy when adding a new published component path.
+- Treat a changed artifact digest, moved tag, npm integrity mismatch, or unexpected dist-tag as a security incident rather than a reason to bypass a check.
