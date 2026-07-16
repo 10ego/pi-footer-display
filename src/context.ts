@@ -1,6 +1,9 @@
 import { BoundedTtlCache, type CachePolarity } from "./cache.js";
 import type { PullRequestLookup } from "./github.js";
-import type { RepositoryInspector } from "./git.js";
+import type {
+  RepositoryDiscoveryOutcome,
+  RepositoryInspector,
+} from "./git.js";
 import type {
   DiscoverySource,
   PathHint,
@@ -67,7 +70,7 @@ export class DefaultRepositoryMetadataLoader implements RepositoryMetadataLoader
 export interface ContextCoreOptions {
   readonly repositories: RepositoryInspector;
   readonly metadata: RepositoryMetadataLoader;
-  readonly pathCache?: BoundedTtlCache<string, string | null>;
+  readonly pathCache?: BoundedTtlCache<string, RepositoryDiscoveryOutcome>;
   readonly metadataCache?: BoundedTtlCache<string, RepositoryMetadata>;
 }
 
@@ -77,7 +80,7 @@ const SOURCES: readonly DiscoverySource[] = ["file", "bash", "fallback"];
 export class ContextCore {
   readonly #repositories: RepositoryInspector;
   readonly #metadata: RepositoryMetadataLoader;
-  readonly #pathCache: BoundedTtlCache<string, string | null>;
+  readonly #pathCache: BoundedTtlCache<string, RepositoryDiscoveryOutcome>;
   readonly #metadataCache: BoundedTtlCache<string, RepositoryMetadata>;
 
   constructor(options: ContextCoreOptions) {
@@ -105,11 +108,24 @@ export class ContextCore {
         ...new Set(hints.filter((hint) => hint.source === source).map((hint) => hint.path)),
       ];
       if (candidates.length === 0) continue;
-      const roots = [...new Set((await Promise.all(candidates.map((candidate) => this.#root(candidate)))).filter(
-        (root): root is string => root !== null,
-      ))].sort();
-      if (roots.length === 0) continue;
+      const discoveries = await Promise.all(
+        candidates.map((candidate) => this.#root(candidate)),
+      );
+      const roots = [
+        ...new Set(
+          discoveries
+            .filter(
+              (outcome): outcome is Extract<RepositoryDiscoveryOutcome, { kind: "repository" }> =>
+                outcome.kind === "repository",
+            )
+            .map((outcome) => outcome.root),
+        ),
+      ].sort();
       if (roots.length > 1) return { kind: "ambiguous", roots };
+      const indeterminate = discoveries.find((outcome) => outcome.kind === "indeterminate");
+      if (indeterminate?.kind === "indeterminate") {
+        return { kind: "unavailable", reason: indeterminate.reason };
+      }
       const root = roots[0];
       if (!root) continue;
 
@@ -119,10 +135,11 @@ export class ContextCore {
         return {
           kind: "unavailable",
           reason: error instanceof Error ? error.message : "metadata lookup failed",
+          root,
         };
       }
     }
-    return { kind: "unavailable", reason: "no repository found" };
+    return { kind: "no-repository" };
   }
 
   invalidatePath(path: string): void {
@@ -138,12 +155,26 @@ export class ContextCore {
     this.#metadataCache.clear();
   }
 
-  async #root(candidate: string): Promise<string | null> {
+  async #root(candidate: string): Promise<RepositoryDiscoveryOutcome> {
     const cached = this.#pathCache.get(candidate);
     if (cached) return cached.value;
-    const root = await this.#repositories.findRoot(candidate);
-    this.#pathCache.set(candidate, root, root ? "positive" : "negative");
-    return root;
+    let outcome: RepositoryDiscoveryOutcome;
+    try {
+      outcome = await this.#repositories.findRoot(candidate);
+    } catch (error) {
+      return {
+        kind: "indeterminate",
+        reason: error instanceof Error ? error.message : "repository discovery failed",
+      };
+    }
+    if (outcome.kind !== "indeterminate") {
+      this.#pathCache.set(
+        candidate,
+        outcome,
+        outcome.kind === "repository" ? "positive" : "negative",
+      );
+    }
+    return outcome;
   }
 
   async #repositoryMetadata(root: string): Promise<RepositoryMetadata> {

@@ -12,16 +12,25 @@ import type {
   LsToolInput,
 } from "@earendil-works/pi-coding-agent";
 import { formatDisplaySegment, formatFooter } from "../src/format.js";
-import { GitRepositoryInspector, parseGitHubRemote, type RepositoryInspector } from "../src/git.js";
+import {
+  GitRepositoryInspector,
+  parseGitHubRemote,
+  type RepositoryDiscoveryOutcome,
+  type RepositoryInspector,
+} from "../src/git.js";
 import { GhPullRequestLookup } from "../src/github.js";
 import { extractBashPaths, extractFileToolPaths } from "../src/paths.js";
-import type { CommandRunner } from "../src/process.js";
+import { ProcessExecutionError, type CommandRunner } from "../src/process.js";
 import { FooterSessionController } from "../src/state.js";
 import type {
   FooterSessionState,
   LocalRepositoryIdentity,
   RepositoryMetadata,
 } from "../src/types.js";
+
+function discovery(root: string | null): RepositoryDiscoveryOutcome {
+  return root ? { kind: "repository", root } : { kind: "not-repository" };
+}
 
 const metadata: RepositoryMetadata = {
   root: "/work/repo",
@@ -92,7 +101,10 @@ test("git discovery uses argv and canonicalizes roots", async () => {
       return "/real/repo";
     },
   });
-  assert.equal(await inspector.findRoot("/work/repo/file;touch bad"), "/real/repo");
+  assert.deepEqual(await inspector.findRoot("/work/repo/file;touch bad"), {
+    kind: "repository",
+    root: "/real/repo",
+  });
   assert.deepEqual(calls, [
     {
       file: "git",
@@ -149,7 +161,10 @@ test("context uses file evidence first and reports conflicts", async () => {
   ]);
   const repositories: RepositoryInspector = {
     async findRoot(candidate) {
-      return roots.get(candidate) ?? null;
+      return discovery(roots.get(candidate) ?? null);
+    },
+    async validateRoot(candidate) {
+      return discovery(roots.get(candidate) ?? null);
     },
     async readIdentity() {
       throw new Error("not used");
@@ -288,18 +303,19 @@ test("parses URL variants without accepting lookalike or non-GitHub remotes", ()
   }
 });
 
-test("git discovery treats deleted paths and missing git as unavailable", async () => {
-  const calls: Array<{ file: string; args: readonly string[] }> = [];
+test("git discovery distinguishes deleted roots, no-repo exits, and process failures", async () => {
+  const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+  let failure: Error = new Error("spawn git ENOENT");
   const inspector = new GitRepositoryInspector(
     {
-      async run(file, args) {
-        calls.push({ file, args });
-        throw new Error("spawn git ENOENT");
+      async run() {
+        throw failure;
       },
     },
     {
-      async stat() {
-        throw new Error("ENOENT");
+      async stat(value) {
+        if (value === "/") return { isDirectory: () => true };
+        throw missing;
       },
       async realpath(value) {
         return value;
@@ -307,13 +323,21 @@ test("git discovery treats deleted paths and missing git as unavailable", async 
     },
   );
 
-  assert.equal(await inspector.findRoot("/deleted/repo/new.ts"), null);
-  assert.deepEqual(calls, [
-    {
-      file: "git",
-      args: ["-C", "/deleted/repo", "rev-parse", "--show-toplevel"],
-    },
-  ]);
+  assert.deepEqual(await inspector.validateRoot("/deleted/repo"), {
+    kind: "not-repository",
+  });
+  assert.deepEqual(await inspector.findRoot("/deleted/repo/new.ts"), {
+    kind: "indeterminate",
+    reason: "spawn git ENOENT",
+  });
+
+  failure = new ProcessExecutionError("not a repository", {
+    kind: "exit",
+    exitCode: 128,
+  });
+  assert.deepEqual(await inspector.findRoot("/deleted/repo/new.ts"), {
+    kind: "not-repository",
+  });
 });
 
 test("git identity handles detached HEAD and skips non-GitHub remotes", async () => {
@@ -416,7 +440,10 @@ test("metadata loader degrades safely for local-only, detached, and failed gh lo
   let ghCalls = 0;
   const repositories: RepositoryInspector = {
     async findRoot() {
-      return null;
+      return discovery(null);
+    },
+    async validateRoot() {
+      return discovery(null);
     },
     async readIdentity(root) {
       const identity = identities.get(root);
@@ -502,8 +529,10 @@ test("context falls through non-repositories and coalesces candidates for one ro
   const repositories: RepositoryInspector = {
     async findRoot(candidate) {
       seen.push(candidate);
-      if (candidate.startsWith("/repo/")) return "/repo";
-      return null;
+      return discovery(candidate.startsWith("/repo/") ? "/repo" : null);
+    },
+    async validateRoot(candidate) {
+      return discovery(candidate === "/repo" ? "/repo" : null);
     },
     async readIdentity() {
       throw new Error("not used");
@@ -528,15 +557,17 @@ test("context falls through non-repositories and coalesces candidates for one ro
   );
   assert.deepEqual(seen, ["/outside/file", "/repo/a", "/repo/b"]);
   assert.deepEqual(await core.resolve([{ path: "/outside/again", source: "file" }]), {
-    kind: "unavailable",
-    reason: "no repository found",
+    kind: "no-repository",
   });
 });
 
 test("context converts metadata failures to unavailable outcomes", async () => {
   const repositories: RepositoryInspector = {
     async findRoot() {
-      return "/repo";
+      return discovery("/repo");
+    },
+    async validateRoot() {
+      return discovery("/repo");
     },
     async readIdentity() {
       throw new Error("not used");
@@ -553,6 +584,7 @@ test("context converts metadata failures to unavailable outcomes", async () => {
   assert.deepEqual(await core.resolve([{ path: "/repo", source: "file" }]), {
     kind: "unavailable",
     reason: "git disappeared",
+    root: "/repo",
   });
 });
 
@@ -568,7 +600,7 @@ test("git discovery walks to an existing ancestor for nested write targets", asy
     {
       async stat(value) {
         if (value === "/repo") return { isDirectory: () => true };
-        throw new Error("ENOENT");
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
       },
       async realpath(value) {
         return value;
@@ -576,7 +608,10 @@ test("git discovery walks to an existing ancestor for nested write targets", asy
     },
   );
 
-  assert.equal(await inspector.findRoot("/repo/new/deep/file.ts"), "/repo");
+  assert.deepEqual(await inspector.findRoot("/repo/new/deep/file.ts"), {
+    kind: "repository",
+    root: "/repo",
+  });
   assert.deepEqual(calls[0], {
     file: "git",
     args: ["-C", "/repo", "rev-parse", "--show-toplevel"],

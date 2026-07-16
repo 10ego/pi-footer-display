@@ -1,6 +1,6 @@
 import path from "node:path";
 import { realpath, stat } from "node:fs/promises";
-import type { CommandRunner } from "./process.js";
+import { ProcessExecutionError, type CommandRunner } from "./process.js";
 import type {
   GitHubRepository,
   GitReference,
@@ -14,13 +14,29 @@ export interface PathFileSystem {
 
 export const nodePathFileSystem: PathFileSystem = { stat, realpath };
 
+export type RepositoryDiscoveryOutcome =
+  | { readonly kind: "repository"; readonly root: string }
+  | { readonly kind: "not-repository" }
+  | { readonly kind: "indeterminate"; readonly reason: string };
+
 export interface RepositoryInspector {
-  findRoot(candidatePath: string): Promise<string | null>;
+  findRoot(candidatePath: string): Promise<RepositoryDiscoveryOutcome>;
+  validateRoot(candidateRoot: string): Promise<RepositoryDiscoveryOutcome>;
   readIdentity(root: string): Promise<LocalRepositoryIdentity>;
 }
 
 function cleanOutput(value: string): string {
   return value.trim();
+}
+
+function errorReason(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function isMissingPathError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  const code = (error as { readonly code?: unknown }).code;
+  return code === "ENOENT" || code === "ENOTDIR";
 }
 
 /** Parses common HTTPS, SSH, SCP-like, and git GitHub remote URL forms. */
@@ -70,21 +86,25 @@ export class GitRepositoryInspector implements RepositoryInspector {
     this.#fs = fs;
   }
 
-  async findRoot(candidatePath: string): Promise<string | null> {
-    const directory = await this.#candidateDirectory(candidatePath);
+  async findRoot(candidatePath: string): Promise<RepositoryDiscoveryOutcome> {
+    let directory: string;
     try {
-      const result = await this.#runner.run("git", [
-        "-C",
-        directory,
-        "rev-parse",
-        "--show-toplevel",
-      ]);
-      const root = cleanOutput(result.stdout);
-      if (!path.isAbsolute(root)) return null;
-      return await this.#fs.realpath(root);
-    } catch {
-      return null;
+      directory = await this.#candidateDirectory(candidatePath);
+    } catch (error) {
+      return { kind: "indeterminate", reason: errorReason(error, "path lookup failed") };
     }
+    return await this.#discoverDirectory(directory);
+  }
+
+  async validateRoot(candidateRoot: string): Promise<RepositoryDiscoveryOutcome> {
+    try {
+      const info = await this.#fs.stat(candidateRoot);
+      if (!info.isDirectory()) return { kind: "not-repository" };
+    } catch (error) {
+      if (isMissingPathError(error)) return { kind: "not-repository" };
+      return { kind: "indeterminate", reason: errorReason(error, "path validation failed") };
+    }
+    return await this.#discoverDirectory(candidateRoot);
   }
 
   async readIdentity(root: string): Promise<LocalRepositoryIdentity> {
@@ -99,24 +119,55 @@ export class GitRepositoryInspector implements RepositoryInspector {
     };
   }
 
+  async #discoverDirectory(directory: string): Promise<RepositoryDiscoveryOutcome> {
+    let result;
+    try {
+      result = await this.#runner.run("git", [
+        "-C",
+        directory,
+        "rev-parse",
+        "--show-toplevel",
+      ]);
+    } catch (error) {
+      if (
+        error instanceof ProcessExecutionError &&
+        error.kind === "exit" &&
+        error.exitCode === 128
+      ) {
+        return { kind: "not-repository" };
+      }
+      return { kind: "indeterminate", reason: errorReason(error, "git lookup failed") };
+    }
+
+    const root = cleanOutput(result.stdout);
+    if (!path.isAbsolute(root)) {
+      return { kind: "indeterminate", reason: "git returned a non-absolute repository root" };
+    }
+    try {
+      return { kind: "repository", root: await this.#fs.realpath(root) };
+    } catch (error) {
+      return { kind: "indeterminate", reason: errorReason(error, "repository realpath failed") };
+    }
+  }
+
   async #candidateDirectory(candidatePath: string): Promise<string> {
     try {
       const info = await this.#fs.stat(candidatePath);
       return info.isDirectory() ? candidatePath : path.dirname(candidatePath);
-    } catch {
+    } catch (error) {
+      if (!isMissingPathError(error)) throw error;
       // Tool calls happen before execution, so a write target may have several
       // not-yet-created parent directories. Walk to the nearest existing directory.
-      const fallback = path.dirname(candidatePath);
-      let current = fallback;
+      let current = path.dirname(candidatePath);
       while (true) {
         try {
           const info = await this.#fs.stat(current);
           if (info.isDirectory()) return current;
-        } catch {
-          // Continue toward the filesystem root.
+        } catch (ancestorError) {
+          if (!isMissingPathError(ancestorError)) throw ancestorError;
         }
         const parent = path.dirname(current);
-        if (parent === current) return fallback;
+        if (parent === current) return current;
         current = parent;
       }
     }

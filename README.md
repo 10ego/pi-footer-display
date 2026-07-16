@@ -29,8 +29,9 @@ Segments are separated by ` · `. Examples below are exact formatter output for 
 | GitHub metadata unavailable | `acme/widget · main · ! · 12m` |
 | Two equally strong repository candidates | `repo? 2 · ? · 12m` |
 | No usable repository | `repo — · ! · 12m` |
+| Persisted pin temporarily unverifiable | `📌 repo — · ~ · 12m` |
 
-`?` means automatic discovery is ambiguous. `!` means some context is unavailable or degraded. A missing PR segment without `!` means the GitHub lookup succeeded but found no open PR for the current branch.
+`?` means automatic discovery is ambiguous. `!` means some context is unavailable or degraded. `~` means persisted context is stale because it could not be revalidated. A missing PR segment without `!` means the GitHub lookup succeeded but found no open PR for the current branch.
 
 Age is compact wall-clock time: seconds under one minute, whole minutes under one hour, then values such as `2h5m` or `1d2h`.
 
@@ -46,7 +47,9 @@ Observed tool calls are grouped over a 100 ms debounce window. Within the strong
 
 - one canonical Git root is selected;
 - multiple roots produce `repo? N · ?` instead of guessing;
-- paths outside a repository are ignored, and an unrelated non-repository path does not discard the last confirmed root.
+- paths confirmed to be outside a repository are ignored, and unrelated non-repository activity does not discard the last confirmed root;
+- an indeterminate discovery failure publishes unavailable context instead of being treated as “not a repository”;
+- if activity resolves to repository B but B's local metadata cannot be read, the footer publishes unavailable context for B rather than continuing to show repository A.
 
 File-tool evidence outranks bash evidence, and the startup fallback cannot override either. Shell pipelines, substitutions, redirections, relative bash paths, multiple absolute operands, and other complex shell forms are intentionally not treated as repository signals. Pinned mode ignores all automatic evidence until it is unpinned.
 
@@ -81,7 +84,7 @@ Consequences:
 - time while Pi is closed is included—it is not active-work duration;
 - a system clock earlier than `startedAt` displays `0s` rather than a negative age.
 
-Restored roots are revalidated and canonicalized. Deleted or invalid pins fall back to a valid last-confirmed root and then to the startup directory.
+Restored roots are revalidated and canonicalized with structured results. A confirmed deleted or non-repository pin may downgrade to automatic mode and fall back to a valid last-confirmed root, then the startup directory. An indeterminate failure—missing or timed-out Git, permission or realpath failure, or another process error—preserves `mode=pinned`, `pinnedRoot`, `lastConfirmedRoot`, and `startedAt`, publishes stale/unavailable status, and does not persist an automatic-mode downgrade.
 
 ## Prerequisites
 
@@ -139,7 +142,7 @@ Repository discovery and metadata are deliberately bounded:
 | Candidate path → Git root | 128 | 5 minutes | 30 seconds |
 | Git root → repository/PR metadata | 32 | 60 seconds | 10 seconds |
 
-Least-recently-used-ish entries are evicted when a cache exceeds its bound. All degraded metadata—detached HEAD, no recognized GitHub remote, or unavailable GitHub lookup—uses the shorter 10-second metadata TTL; a successful lookup with no open PR is a positive result. `/pr-footer refresh` invalidates the relevant entries. The once-per-second age redraw only reformats existing state; it does not invoke Git, `gh`, or network access.
+Least-recently-used-ish entries are evicted when a cache exceeds its bound. Only confirmed repository and non-repository discovery results are cached; indeterminate Git, filesystem, realpath, and process failures are not. All degraded metadata—detached HEAD, no recognized GitHub remote, or unavailable GitHub lookup—uses the shorter 10-second metadata TTL; a successful lookup with no open PR is a positive result. `/pr-footer refresh` invalidates the relevant entries. The once-per-second age redraw only reformats existing state; it does not invoke Git, `gh`, or network access.
 
 Every `git` and `gh` operation is launched directly without a shell, has a 10-second timeout, and accepts at most 1 MiB of output. GitHub lookup uses an explicit target rather than ambient repository inference:
 
@@ -155,7 +158,9 @@ Network access occurs only through `gh` when a recognized `github.com` remote an
 - **No open PR:** omits the PR segment without a warning marker.
 - **Non-GitHub or unsupported remote:** uses the local directory name and branch with `!`; no PR lookup is attempted.
 - **Missing `gh`, unauthenticated `gh`, timeout, malformed response, or network failure:** keeps local Git context and adds `!`.
-- **Missing `git`, unreadable identity, or no Git repository:** shows `repo — · !` with age.
+- **Confirmed non-repository path:** unrelated automatic activity retains the last confirmed repository; a confirmed invalid restored pin may safely downgrade and fall back.
+- **Missing or timed-out `git`, permission/realpath/process failure, or unreadable local identity:** shows unavailable or stale context rather than claiming the path is not a repository. A restored pin and its persisted fields survive such transient startup failures.
+- **Repository root found but metadata unreadable:** shows `repo — · !` for that repository context and never silently leaves a previous repository displayed as current.
 - **Ambiguous strongest-tier evidence:** shows the candidate count and `?`; use `pin` to choose explicitly.
 
 ## Security and privacy

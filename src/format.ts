@@ -56,6 +56,7 @@ function outcomeParts(outcome: ResolutionOutcome): string[] {
       return metadataParts(outcome.metadata);
     case "ambiguous":
       return [`repo? ${outcome.roots.length}`, "?"];
+    case "no-repository":
     case "unavailable":
       return ["repo —", "!"];
     case "stale":

@@ -9,6 +9,24 @@ export interface CommandRunner {
   run(file: string, args: readonly string[]): Promise<ProcessResult>;
 }
 
+export type ProcessFailureKind = "exit" | "spawn" | "timeout" | "signal" | "process";
+
+/** Structured process failure so callers never infer semantics from error text. */
+export class ProcessExecutionError extends Error {
+  readonly kind: ProcessFailureKind;
+  readonly exitCode: number | undefined;
+
+  constructor(
+    message: string,
+    options: { readonly kind: ProcessFailureKind; readonly exitCode?: number; readonly cause?: unknown },
+  ) {
+    super(message, { cause: options.cause });
+    this.name = "ProcessExecutionError";
+    this.kind = options.kind;
+    this.exitCode = options.exitCode;
+  }
+}
+
 export interface ExecFileRunnerOptions {
   readonly timeoutMs?: number;
   readonly maxBufferBytes?: number;
@@ -37,10 +55,25 @@ export class ExecFileRunner implements CommandRunner {
         },
         (error, stdout, stderr) => {
           if (error) {
+            const code = error.code;
+            const kind: ProcessFailureKind = error.killed
+              ? "timeout"
+              : typeof code === "number"
+                ? "exit"
+                : error.signal
+                  ? "signal"
+                  : typeof code === "string"
+                    ? "spawn"
+                    : "process";
             reject(
-              new Error(`${file} exited unsuccessfully: ${stderr.trim() || error.message}`, {
-                cause: error,
-              }),
+              new ProcessExecutionError(
+                `${file} exited unsuccessfully: ${stderr.trim() || error.message}`,
+                {
+                  kind,
+                  ...(typeof code === "number" ? { exitCode: code } : {}),
+                  cause: error,
+                },
+              ),
             );
             return;
           }

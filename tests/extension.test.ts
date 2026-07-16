@@ -15,7 +15,10 @@ import {
   type FooterDependencies,
   type PersistedFooterState,
 } from "../src/extension.js";
-import type { RepositoryInspector } from "../src/git.js";
+import type {
+  RepositoryDiscoveryOutcome,
+  RepositoryInspector,
+} from "../src/git.js";
 import type { RepositoryMetadata } from "../src/types.js";
 
 interface Harness {
@@ -39,6 +42,10 @@ function createHarness(): Harness {
   return { pi, appended, notifications, statuses };
 }
 
+function discovery(root: string | null): RepositoryDiscoveryOutcome {
+  return root ? { kind: "repository", root } : { kind: "not-repository" };
+}
+
 function metadata(root: string): RepositoryMetadata {
   return {
     root,
@@ -55,9 +62,12 @@ function dependencies(
   const repositories: RepositoryInspector = {
     async findRoot(candidate) {
       for (const root of ["/repo/a", "/repo/b", "/repo/c"]) {
-        if (candidate === root || candidate.startsWith(`${root}/`)) return root;
+        if (candidate === root || candidate.startsWith(`${root}/`)) return discovery(root);
       }
-      return null;
+      return discovery(null);
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
     },
     async readIdentity(root) {
       return metadata(root);
@@ -179,7 +189,56 @@ test("factory registration starts no dependencies and restores pinned state", as
   });
 });
 
-test("invalid restored pins fall back to a validated last confirmed root before cwd", async () => {
+test("persisted pin survives transient startup validation failure with stale display", async () => {
+  const harness = createHarness();
+  const repositories: RepositoryInspector = {
+    async findRoot() {
+      return { kind: "indeterminate", reason: "git timed out" };
+    },
+    async validateRoot() {
+      return { kind: "indeterminate", reason: "git timed out" };
+    },
+    async readIdentity(root) {
+      return metadata(root);
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    ageIntervalMs: 60_000,
+    now: () => 61_000,
+  });
+  const restored: PersistedFooterState = {
+    version: 1,
+    startedAt: 1_000,
+    mode: "pinned",
+    pinnedRoot: "/repo/b",
+    lastConfirmedRoot: "/repo/a",
+  };
+  const ctx = context(harness, { cwd: "/repo/c", states: [restored] });
+
+  await runtime.start(ctx);
+
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^📌 repo — · ~ · 1m$/u);
+  await runtime.handleCommand("status", ctx);
+  assert.match(
+    harness.notifications.at(-1)?.message ?? "",
+    /mode pinned · \/repo\/b$/u,
+  );
+  assert.deepEqual(harness.appended, []);
+  runtime.shutdown(ctx);
+});
+
+test("confirmed non-repository restored pin downgrades to validated fallback", async () => {
   const harness = createHarness();
   const runtime = registerFooterDisplay(harness.pi, {
     createDependencies: dependencies,
@@ -207,6 +266,103 @@ test("invalid restored pins fall back to a validated last confirmed root before 
     },
   });
 
+  runtime.shutdown(ctx);
+});
+
+test("deleted restored pin is confirmed invalid and safely downgrades to cwd", async () => {
+  const harness = createHarness();
+  const seenValidations: string[] = [];
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      return discovery(candidate === "/repo/a" ? "/repo/a" : null);
+    },
+    async validateRoot(candidate) {
+      seenValidations.push(candidate);
+      return candidate === "/deleted/pin"
+        ? { kind: "not-repository" }
+        : discovery(candidate);
+    },
+    async readIdentity(root) {
+      return metadata(root);
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    ageIntervalMs: 60_000,
+  });
+  const restored: PersistedFooterState = {
+    version: 1,
+    startedAt: 1_000,
+    mode: "pinned",
+    pinnedRoot: "/deleted/pin",
+  };
+
+  await runtime.start(context(harness, { cwd: "/repo/a", states: [restored] }));
+
+  assert.deepEqual(seenValidations, ["/deleted/pin"]);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/a/u);
+  assert.deepEqual(harness.appended.at(-1)?.data, {
+    version: 1,
+    startedAt: 1_000,
+    mode: "auto",
+    lastConfirmedRoot: "/repo/a",
+  });
+  runtime.shutdown();
+});
+
+test("repo metadata failure replaces prior automatic repo instead of displaying it", async () => {
+  const harness = createHarness();
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      for (const root of ["/repo/a", "/repo/b"]) {
+        if (candidate === root || candidate.startsWith(`${root}/`)) return discovery(root);
+      }
+      return discovery(null);
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      return metadata(root);
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            if (root === "/repo/b") throw new Error("repository metadata unavailable");
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    debounceMs: 5,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness, { cwd: "/repo/a" });
+  await runtime.start(ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/a/u);
+
+  runtime.observeToolCall(readCall("/repo/b/failing.ts"), ctx);
+  await wait(15);
+
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^repo — · !/u);
+  assert.doesNotMatch(harness.statuses.at(-1)?.text ?? "", /acme\/a/u);
+  await runtime.handleCommand("status", ctx);
+  assert.match(harness.notifications.at(-1)?.message ?? "", /mode auto · \/repo\/b$/u);
   runtime.shutdown(ctx);
 });
 
@@ -300,7 +456,10 @@ test("shutdown rejects late async startup completion", async () => {
   let finish: (() => void) | undefined;
   const repositories: RepositoryInspector = {
     async findRoot() {
-      return "/repo/a";
+      return discovery("/repo/a");
+    },
+    async validateRoot() {
+      return discovery("/repo/a");
     },
     async readIdentity(root) {
       return metadata(root);
@@ -358,8 +517,12 @@ test("changed restored roots are canonicalized and deleted roots fall back to cw
   const changedHarness = createHarness();
   const changedRepositories: RepositoryInspector = {
     async findRoot(candidate) {
-      if (candidate === "/repo/old" || candidate === "/repo/new") return "/repo/new";
-      return null;
+      return discovery(
+        candidate === "/repo/old" || candidate === "/repo/new" ? "/repo/new" : null,
+      );
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
     },
     async readIdentity(root) {
       return metadata(root);
@@ -429,9 +592,12 @@ test("commands report unavailable state and cover pin, refresh, unpin, and statu
   const repositories: RepositoryInspector = {
     async findRoot(candidate) {
       for (const root of ["/repo/a", "/repo/b"]) {
-        if (candidate === root || candidate.startsWith(`${root}/`)) return root;
+        if (candidate === root || candidate.startsWith(`${root}/`)) return discovery(root);
       }
-      return null;
+      return discovery(null);
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
     },
     async readIdentity(root) {
       return metadata(root);
@@ -591,7 +757,7 @@ test("concurrent pin transitions keep tool evidence blocked until every pin sett
       const root = ["/repo/a", "/repo/b", "/repo/c"].find(
         (value) => candidate === value || candidate.startsWith(`${value}/`),
       );
-      if (!root) return null;
+      if (!root) return discovery(null);
       if (candidate === "/repo/b" && findCounts.get(candidate) === 1) {
         await new Promise<void>((resolve) => {
           finishB = resolve;
@@ -602,7 +768,10 @@ test("concurrent pin transitions keep tool evidence blocked until every pin sett
           finishC = resolve;
         });
       }
-      return root;
+      return discovery(root);
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
     },
     async readIdentity(root) {
       return metadata(root);
@@ -651,9 +820,12 @@ test("newer debounced resolution rejects an older async generation", async () =>
   const repositories: RepositoryInspector = {
     async findRoot(candidate) {
       for (const root of ["/repo/a", "/repo/b", "/repo/c"]) {
-        if (candidate === root || candidate.startsWith(`${root}/`)) return root;
+        if (candidate === root || candidate.startsWith(`${root}/`)) return discovery(root);
       }
-      return null;
+      return discovery(null);
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
     },
     async readIdentity(root) {
       return metadata(root);

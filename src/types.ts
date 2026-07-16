@@ -37,7 +37,8 @@ export interface RepositoryMetadata extends LocalRepositoryIdentity {
 export type ResolutionOutcome =
   | { readonly kind: "resolved"; readonly metadata: RepositoryMetadata }
   | { readonly kind: "ambiguous"; readonly roots: readonly string[] }
-  | { readonly kind: "unavailable"; readonly reason: string }
+  | { readonly kind: "no-repository" }
+  | { readonly kind: "unavailable"; readonly reason: string; readonly root?: string }
   | {
       readonly kind: "stale";
       readonly reason: string;

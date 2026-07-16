@@ -7,7 +7,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { ContextCore, DefaultRepositoryMetadataLoader } from "./context.js";
 import { formatFooter } from "./format.js";
-import { GitRepositoryInspector, type RepositoryInspector } from "./git.js";
+import {
+  GitRepositoryInspector,
+  type RepositoryDiscoveryOutcome,
+  type RepositoryInspector,
+} from "./git.js";
 import { GhPullRequestLookup } from "./github.js";
 import { extractBashPaths, extractFileToolPaths, fallbackPath } from "./paths.js";
 import { ExecFileRunner } from "./process.js";
@@ -200,6 +204,10 @@ export class FooterExtensionRuntime {
     const restored = restoration.state;
     this.#lastPersisted = restoration.fromEntry ? restored : undefined;
     this.#controller = new FooterSessionController(restored.startedAt);
+    this.#lastConfirmedRoot = restored.lastConfirmedRoot;
+    if (restored.mode === "pinned" && restored.pinnedRoot) {
+      this.#controller.pin(restored.pinnedRoot);
+    }
 
     this.#ageTimer = setInterval(() => {
       if (this.#active(lifecycle)) this.#publish();
@@ -208,29 +216,61 @@ export class FooterExtensionRuntime {
     try {
       this.#dependencies = this.#createDependencies();
     } catch (error) {
+      const reason = error instanceof Error ? error.message : "dependency creation failed";
       const generation = this.#controller.beginRefresh();
-      this.#controller.commit(generation, unavailable(error));
+      this.#controller.commit(
+        generation,
+        restored.pinnedRoot || restored.lastConfirmedRoot
+          ? { kind: "stale", reason }
+          : unavailable(error),
+      );
       this.#publish();
       this.#persistIfChanged();
       return;
     }
 
-    const [pinnedRoot, lastConfirmedRoot] = await Promise.all([
+    const validations = new Map<string, Promise<RepositoryDiscoveryOutcome>>();
+    const validateRestored = (root: string): Promise<RepositoryDiscoveryOutcome> => {
+      const pending = validations.get(root) ?? this.#validateRoot(root, true);
+      validations.set(root, pending);
+      return pending;
+    };
+    const [pinnedValidation, lastConfirmedValidation] = await Promise.all([
       restored.mode === "pinned" && restored.pinnedRoot
-        ? this.#validateRoot(restored.pinnedRoot)
+        ? validateRestored(restored.pinnedRoot)
         : undefined,
       restored.lastConfirmedRoot
-        ? this.#validateRoot(restored.lastConfirmedRoot)
+        ? validateRestored(restored.lastConfirmedRoot)
         : undefined,
     ]);
     if (!this.#active(lifecycle)) return;
 
-    this.#lastConfirmedRoot = lastConfirmedRoot;
-    if (restored.mode === "pinned" && pinnedRoot) {
-      this.#controller.pin(pinnedRoot);
+    const indeterminateValidation =
+      pinnedValidation?.kind === "indeterminate"
+        ? pinnedValidation
+        : lastConfirmedValidation?.kind === "indeterminate"
+          ? lastConfirmedValidation
+          : undefined;
+    if (indeterminateValidation) {
+      this.#publishRestorationFailure(indeterminateValidation.reason);
+      return;
     }
 
-    const selectedRoot = pinnedRoot ?? lastConfirmedRoot;
+    let selectedRoot: string | undefined;
+    if (pinnedValidation?.kind === "repository") {
+      selectedRoot = pinnedValidation.root;
+      this.#controller.pin(selectedRoot);
+    } else if (restored.mode === "pinned") {
+      this.#controller.unpin();
+    }
+
+    if (lastConfirmedValidation?.kind === "repository") {
+      this.#lastConfirmedRoot = lastConfirmedValidation.root;
+    } else if (lastConfirmedValidation?.kind === "not-repository") {
+      this.#lastConfirmedRoot = undefined;
+    }
+
+    selectedRoot ??= this.#lastConfirmedRoot;
     const hints = selectedRoot
       ? [{ path: selectedRoot, source: "file" as const }]
       : [fallbackPath(this.#startupCwd)];
@@ -317,12 +357,17 @@ export class FooterExtensionRuntime {
     this.#clearPendingHints();
 
     try {
-      const root = await this.#validateRoot(candidate);
+      const validation = await this.#validateRoot(candidate);
       if (!this.#active(lifecycle) || controller.state.generation !== guardGeneration) return;
-      if (!root) {
+      if (validation.kind === "not-repository") {
         ctx.ui.notify(`Not a git repository: ${candidate}`, "error");
         return;
       }
+      if (validation.kind === "indeterminate") {
+        ctx.ui.notify(`Unable to validate repository: ${candidate}`, "error");
+        return;
+      }
+      const root = validation.root;
 
       this.#dependencies?.core.invalidatePath(candidate);
       this.#dependencies?.core.invalidatePath(root);
@@ -374,9 +419,8 @@ export class FooterExtensionRuntime {
     const controller = this.#controller;
     const root =
       controller?.state.pinnedRoot ??
-      (controller?.state.outcome.kind === "resolved"
-        ? controller.state.outcome.metadata.root
-        : this.#lastConfirmedRoot);
+      this.#outcomeRoot(controller?.state.outcome) ??
+      this.#lastConfirmedRoot;
     if (root) {
       this.#dependencies?.core.invalidatePath(root);
       this.#dependencies?.core.invalidateRepository(root);
@@ -408,8 +452,8 @@ export class FooterExtensionRuntime {
     const generation = controller.beginRefresh();
     const outcome = await this.#safeResolve(hints);
     if (!this.#active(lifecycle) || controller.state.mode !== "auto") return;
-    // An unrelated non-repository path is not evidence to discard a confirmed root.
-    if (outcome.kind === "unavailable" && this.#lastConfirmedRoot) return;
+    // Confirmed unrelated non-repository activity is not evidence to discard a root.
+    if (outcome.kind === "no-repository" && this.#lastConfirmedRoot) return;
     this.#commitOutcome(outcome, lifecycle, generation);
   }
 
@@ -456,13 +500,43 @@ export class FooterExtensionRuntime {
     }
   }
 
-  async #validateRoot(candidate: string): Promise<string | undefined> {
+  async #validateRoot(
+    candidate: string,
+    restoredRoot = false,
+  ): Promise<RepositoryDiscoveryOutcome> {
     try {
-      const root = await this.#dependencies?.repositories.findRoot(candidate);
-      return root && path.isAbsolute(root) ? root : undefined;
-    } catch {
-      return undefined;
+      const repositories = this.#dependencies?.repositories;
+      if (!repositories) {
+        return { kind: "indeterminate", reason: "footer is not initialized" };
+      }
+      const outcome = restoredRoot
+        ? await repositories.validateRoot(candidate)
+        : await repositories.findRoot(candidate);
+      if (outcome.kind === "repository" && !path.isAbsolute(outcome.root)) {
+        return { kind: "indeterminate", reason: "git returned a non-absolute repository root" };
+      }
+      return outcome;
+    } catch (error) {
+      return {
+        kind: "indeterminate",
+        reason: error instanceof Error ? error.message : "repository validation failed",
+      };
     }
+  }
+
+  #publishRestorationFailure(reason: string): void {
+    const controller = this.#controller;
+    if (!controller) return;
+    const generation = controller.beginRefresh();
+    controller.commit(generation, { kind: "stale", reason });
+    this.#publish();
+    this.#persistIfChanged();
+  }
+
+  #outcomeRoot(outcome: ResolutionOutcome | undefined): string | undefined {
+    if (outcome?.kind === "resolved") return outcome.metadata.root;
+    if (outcome?.kind === "unavailable") return outcome.root;
+    return undefined;
   }
 
   #snapshot(): PersistedFooterState | undefined {
@@ -510,10 +584,7 @@ export class FooterExtensionRuntime {
       return;
     }
     const root =
-      state.pinnedRoot ??
-      (state.outcome.kind === "resolved"
-        ? state.outcome.metadata.root
-        : this.#lastConfirmedRoot);
+      state.pinnedRoot ?? this.#outcomeRoot(state.outcome) ?? this.#lastConfirmedRoot;
     ctx.ui.notify(
       `${formatFooter(state, this.#now())} · mode ${state.mode}${root ? ` · ${root}` : ""}`,
       "info",
