@@ -1,7 +1,7 @@
 {
   "name": "pi-footer-display",
   "version": "0.1.0",
-  "description": "A Pi extension for displaying repository context without replacing the native footer.",
+  "description": "Add Git repository, branch, pull request, and session age context to Pi's native footer.",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -9,7 +9,8 @@
   },
   "files": [
     "src",
-    "ARCHITECTURE.md"
+    "ARCHITECTURE.md",
+    "README.md"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -20,7 +21,10 @@
     "pi-extension",
     "pi-coding-agent",
     "footer",
-    "github"
+    "git",
+    "github",
+    "pull-request",
+    "status"
   ],
   "pi": {
     "extensions": [
@@ -28,7 +32,7 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.80.7"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.80.7",
