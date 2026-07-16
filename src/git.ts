@@ -37,10 +37,13 @@ export function parseGitHubRemote(remote: string): GitHubRepository | undefined 
       pathname = url.pathname;
     }
   } catch {
+    // SCP-like remotes are handled below; other invalid URLs remain unsupported.
+  }
+
+  if (!pathname) {
     const scp = /^(?:[^@\s]+@)?github\.com:([^\s]+)$/iu.exec(value);
     pathname = scp?.[1];
   }
-
   if (!pathname) return undefined;
   const parts = pathname.replace(/^\/+|\/+$/gu, "").split("/");
   if (parts.length !== 2) return undefined;

@@ -104,7 +104,7 @@ function tokenizeSimpleCommand(command: string): string[] | undefined {
       index += 1;
       continue;
     }
-    if (";$`|<>(){}".includes(char)) return undefined;
+    if ("&;$`|<>(){}".includes(char)) return undefined;
     word += char;
   }
   if (escaping || quote) return undefined;
@@ -116,8 +116,9 @@ function executableName(value: string): string {
   return path.basename(value);
 }
 
-function uniqueAbsolute(values: readonly string[]): string[] {
-  return [...new Set(values.filter((value) => path.isAbsolute(value)))];
+function oneUnambiguousAbsolute(values: readonly string[]): string[] {
+  const absolute = [...new Set(values.filter((value) => path.isAbsolute(value)))];
+  return absolute.length === 1 ? absolute : [];
 }
 
 /**
@@ -143,11 +144,11 @@ export function extractBashPaths(command: string): PathHint[] {
     for (let index = 1; index < words.length - 1; index += 1) {
       if (words[index] === "-C") paths.push(words[index + 1] ?? "");
     }
-    return uniqueAbsolute(paths).map((value) => ({ path: value, source: "bash" }));
+    return oneUnambiguousAbsolute(paths).map((value) => ({ path: value, source: "bash" }));
   }
 
   if (!EXPLICIT_PATH_COMMANDS.has(executable)) return [];
-  return uniqueAbsolute(words.slice(1)).map((value) => ({
+  return oneUnambiguousAbsolute(words.slice(1)).map((value) => ({
     path: value,
     source: "bash",
   }));

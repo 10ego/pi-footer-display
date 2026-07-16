@@ -10,6 +10,7 @@ import { ContextCore, type RepositoryMetadataLoader } from "../src/context.js";
 import {
   FOOTER_STATE_ENTRY,
   FOOTER_STATUS_KEY,
+  parsePersistedFooterState,
   registerFooterDisplay,
   type FooterDependencies,
   type PersistedFooterState,
@@ -210,6 +211,8 @@ test("debounces file evidence, reports conflicts, switches once, and pinned mode
   await wait(30);
   assert.match(harness.statuses.at(-1)?.text ?? "", /^repo\? 2/u);
   assert.equal(harness.appended.length, 1);
+  await runtime.handleCommand("status", ctx);
+  assert.match(harness.notifications.at(-1)?.message ?? "", /mode auto · \/repo\/a$/u);
 
   runtime.observeToolCall(readCall("/repo/b/one.ts"), ctx);
   await wait(30);
@@ -282,4 +285,295 @@ test("shutdown rejects late async startup completion", async () => {
 
   assert.equal(harness.statuses.at(-1)?.text, undefined);
   assert.equal(harness.appended.length, 0);
+});
+
+test("persisted state validation rejects malformed and inconsistent entries", () => {
+  assert.equal(parsePersistedFooterState(null), undefined);
+  assert.equal(parsePersistedFooterState({ version: 2, startedAt: 1, mode: "auto" }), undefined);
+  assert.equal(parsePersistedFooterState({ version: 1, startedAt: 0, mode: "auto" }), undefined);
+  assert.equal(parsePersistedFooterState({ version: 1, startedAt: 1, mode: "pinned" }), undefined);
+  assert.equal(
+    parsePersistedFooterState({ version: 1, startedAt: 1, mode: "auto", lastConfirmedRoot: "relative" }),
+    undefined,
+  );
+  assert.deepEqual(
+    parsePersistedFooterState({
+      version: 1,
+      startedAt: 1_000,
+      mode: "auto",
+      pinnedRoot: "/ignored",
+      lastConfirmedRoot: "/repo/a",
+    }),
+    { version: 1, startedAt: 1_000, mode: "auto", lastConfirmedRoot: "/repo/a" },
+  );
+});
+
+test("changed restored roots are canonicalized and deleted roots fall back to cwd", async () => {
+  const changedHarness = createHarness();
+  const changedRepositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      if (candidate === "/repo/old" || candidate === "/repo/new") return "/repo/new";
+      return null;
+    },
+    async readIdentity(root) {
+      return metadata(root);
+    },
+  };
+  const changedRuntime = registerFooterDisplay(changedHarness.pi, {
+    createDependencies: () => ({
+      repositories: changedRepositories,
+      core: new ContextCore({
+        repositories: changedRepositories,
+        metadata: {
+          async load(root) {
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    ageIntervalMs: 60_000,
+  });
+  const changedState: PersistedFooterState = {
+    version: 1,
+    startedAt: 1_000,
+    mode: "pinned",
+    pinnedRoot: "/repo/old",
+    lastConfirmedRoot: "/repo/old",
+  };
+  await changedRuntime.start(context(changedHarness, { states: [changedState] }));
+  assert.match(changedHarness.statuses.at(-1)?.text ?? "", /^📌 acme\/new/u);
+  assert.deepEqual(changedHarness.appended.at(-1)?.data, {
+    version: 1,
+    startedAt: 1_000,
+    mode: "pinned",
+    pinnedRoot: "/repo/new",
+    lastConfirmedRoot: "/repo/new",
+  });
+  changedRuntime.shutdown();
+
+  const deletedHarness = createHarness();
+  const deletedRuntime = registerFooterDisplay(deletedHarness.pi, {
+    createDependencies: dependencies,
+    ageIntervalMs: 60_000,
+  });
+  const deletedState: PersistedFooterState = {
+    version: 1,
+    startedAt: 2_000,
+    mode: "pinned",
+    pinnedRoot: "/deleted/pin",
+    lastConfirmedRoot: "/deleted/last",
+  };
+  await deletedRuntime.start(
+    context(deletedHarness, { cwd: "/repo/a", states: [deletedState] }),
+  );
+  assert.match(deletedHarness.statuses.at(-1)?.text ?? "", /^acme\/a/u);
+  assert.deepEqual(deletedHarness.appended.at(-1)?.data, {
+    version: 1,
+    startedAt: 2_000,
+    mode: "auto",
+    lastConfirmedRoot: "/repo/a",
+  });
+  deletedRuntime.shutdown();
+});
+
+test("commands report unavailable state and cover pin, refresh, unpin, and status transitions", async () => {
+  const harness = createHarness();
+  let failLoads = false;
+  let loadCount = 0;
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      for (const root of ["/repo/a", "/repo/b"]) {
+        if (candidate === root || candidate.startsWith(`${root}/`)) return root;
+      }
+      return null;
+    },
+    async readIdentity(root) {
+      return metadata(root);
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            loadCount += 1;
+            if (failLoads) throw new Error("git unavailable");
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+
+  await runtime.handleCommand("status", ctx);
+  assert.deepEqual(harness.notifications.at(-1), {
+    message: "Repository footer is not initialized",
+    type: "warning",
+  });
+
+  await runtime.start(ctx);
+  await runtime.handleCommand("status", ctx);
+  assert.match(harness.notifications.at(-1)?.message ?? "", /mode auto · \/repo\/a$/u);
+  await runtime.handleCommand("pin", ctx);
+  assert.equal(harness.notifications.at(-1)?.message, "pin requires a path");
+  await runtime.handleCommand("pin /missing", ctx);
+  assert.match(harness.notifications.at(-1)?.message ?? "", /^Not a git repository:/u);
+  await runtime.handleCommand("unpin", ctx);
+  assert.equal(harness.notifications.at(-1)?.message, "Repository selection is already automatic");
+
+  await runtime.handleCommand("pin ../b", ctx);
+  assert.equal(harness.notifications.at(-1)?.message, "Pinned repository: /repo/b");
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^📌 acme\/b/u);
+
+  failLoads = true;
+  await runtime.handleCommand("refresh", ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^📌 repo — · !/u);
+  assert.equal(harness.notifications.at(-1)?.message, "Repository footer refreshed");
+
+  failLoads = false;
+  await runtime.handleCommand("unpin", ctx);
+  assert.equal(harness.notifications.at(-1)?.message, "Repository selection is automatic");
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/b/u);
+  await runtime.handleCommand("refresh", ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/b/u);
+  assert.ok(loadCount >= 5);
+
+  runtime.shutdown(ctx);
+  await runtime.handleCommand("status", ctx);
+  assert.equal(harness.notifications.at(-1)?.type, "warning");
+});
+
+test("dependency factory failure is contained and command operations remain unavailable", async () => {
+  const harness = createHarness();
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies() {
+      throw new Error("missing git executable");
+    },
+    ageIntervalMs: 60_000,
+    now: () => 10_000,
+  });
+  const ctx = context(harness);
+  await runtime.start(ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^repo — · !/u);
+  assert.equal(harness.appended.length, 1);
+  await runtime.handleCommand("refresh", ctx);
+  assert.equal(harness.notifications.at(-1)?.type, "warning");
+  runtime.shutdown(ctx);
+});
+
+test("startedAt remains stable across refresh and restored runtime starts", async () => {
+  const harness = createHarness();
+  let now = 62_000;
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: dependencies,
+    ageIntervalMs: 60_000,
+    now: () => now,
+  });
+  const firstContext = context(harness, { timestamp: "1970-01-01T00:00:02.000Z" });
+  await runtime.start(firstContext);
+  const firstState = harness.appended.at(-1)?.data as PersistedFooterState;
+  assert.equal(firstState.startedAt, 2_000);
+  await runtime.handleCommand("refresh", firstContext);
+  assert.equal((harness.appended.at(-1)?.data as PersistedFooterState).startedAt, 2_000);
+  runtime.shutdown(firstContext);
+
+  harness.appended.length = 0;
+  now = 122_000;
+  const restoredContext = context(harness, { states: [firstState] });
+  await runtime.start(restoredContext);
+  assert.equal(harness.appended.length, 0);
+  assert.match(harness.statuses.at(-1)?.text ?? "", / · 2m$/u);
+  runtime.shutdown(restoredContext);
+});
+
+test("newer debounced resolution rejects an older async generation", async () => {
+  const harness = createHarness();
+  const pending = new Map<string, () => void>();
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      for (const root of ["/repo/a", "/repo/b", "/repo/c"]) {
+        if (candidate === root || candidate.startsWith(`${root}/`)) return root;
+      }
+      return null;
+    },
+    async readIdentity(root) {
+      return metadata(root);
+    },
+  };
+  const loader: RepositoryMetadataLoader = {
+    async load(root) {
+      if (root === "/repo/a") return { metadata: metadata(root), polarity: "positive" };
+      return await new Promise((resolve) => {
+        pending.set(root, () => resolve({ metadata: metadata(root), polarity: "positive" }));
+      });
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({ repositories, metadata: loader }),
+    }),
+    debounceMs: 5,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+  await runtime.start(ctx);
+
+  runtime.observeToolCall(readCall("/repo/b/slow.ts"), ctx);
+  await wait(10);
+  assert.ok(pending.has("/repo/b"));
+  runtime.observeToolCall(readCall("/repo/c/fast.ts"), ctx);
+  await wait(10);
+  assert.ok(pending.has("/repo/c"));
+
+  pending.get("/repo/c")?.();
+  await wait(0);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/c/u);
+  const statusesAfterNewer = harness.statuses.length;
+  const entriesAfterNewer = harness.appended.length;
+
+  pending.get("/repo/b")?.();
+  await wait(0);
+  assert.equal(harness.statuses.length, statusesAfterNewer);
+  assert.equal(harness.appended.length, entriesAfterNewer);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/c/u);
+  runtime.shutdown(ctx);
+});
+
+test("repeated starts and shutdowns cancel pending debounce and age resources", async () => {
+  const harness = createHarness();
+  let creations = 0;
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies() {
+      creations += 1;
+      return dependencies();
+    },
+    debounceMs: 15,
+    ageIntervalMs: 5,
+  });
+  const first = context(harness, { cwd: "/repo/a" });
+  await runtime.start(first);
+  runtime.observeToolCall(readCall("/repo/b/pending.ts"), first);
+
+  const second = context(harness, { cwd: "/repo/c" });
+  await runtime.start(second);
+  assert.equal(creations, 2);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/c/u);
+  await wait(25);
+  assert.doesNotMatch(harness.statuses.at(-1)?.text ?? "", /^acme\/b/u);
+
+  runtime.shutdown(second);
+  const statusCountAfterShutdown = harness.statuses.length;
+  await wait(15);
+  assert.equal(harness.statuses.length, statusCountAfterShutdown);
+  runtime.shutdown(second);
+  assert.equal(harness.statuses.length, statusCountAfterShutdown);
+
+  await runtime.start(first);
+  assert.equal(creations, 3);
+  runtime.shutdown(first);
 });
