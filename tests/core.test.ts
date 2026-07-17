@@ -18,8 +18,17 @@ import {
   type RepositoryDiscoveryOutcome,
   type RepositoryInspector,
 } from "../src/git.js";
-import { GhPullRequestLookup } from "../src/github.js";
-import { extractBashPaths, extractFileToolPaths } from "../src/paths.js";
+import {
+  CachedPullRequestLookup,
+  GhPullRequestLookup,
+  pullRequestQueryFingerprint,
+} from "../src/github.js";
+import {
+  extractBashPaths,
+  extractFileToolPaths,
+  inferBashCommand,
+  inferToolCall,
+} from "../src/paths.js";
 import { ExecFileRunner, ProcessExecutionError, type CommandRunner } from "../src/process.js";
 import { FooterSessionController } from "../src/state.js";
 import type {
@@ -69,6 +78,86 @@ test("extracts strong file paths and only narrow bash forms", () => {
   assert.deepEqual(extractBashPaths("cd relative && npm test"), []);
   assert.deepEqual(extractBashPaths("cd /work/repo && npm test && pwd"), []);
   assert.deepEqual(extractBashPaths("cat /work/a\npwd"), []);
+});
+
+test("infers relative literal cwd, git -C, worktree, and gh effects", () => {
+  assert.deepEqual(
+    inferBashCommand("cd ../b && git status", "/work/a"),
+    {
+      hints: [{ path: "/work/b", source: "bash" }],
+      effects: [],
+    },
+  );
+  assert.deepEqual(
+    inferBashCommand("git -C ../b switch feature/footer", "/work/a"),
+    {
+      hints: [{ path: "/work/b", source: "bash" }],
+      effects: [{ kind: "git-mutation", rootPath: "/work/b" }],
+    },
+  );
+  assert.deepEqual(
+    inferBashCommand("git worktree add ../b feature/footer", "/work/a"),
+    {
+      hints: [
+        { path: "/work/b", source: "file" },
+        { path: "/work/a", source: "bash" },
+      ],
+      effects: [{
+        kind: "worktree-add",
+        rootPath: "/work/a",
+        destinationPath: "/work/b",
+      }],
+    },
+  );
+  assert.deepEqual(
+    inferBashCommand("gh pr create --title 'Footer refresh'", "/work/a"),
+    {
+      hints: [{ path: "/work/a", source: "bash" }],
+      effects: [{ kind: "github-pr-mutation", rootPath: "/work/a" }],
+    },
+  );
+  assert.deepEqual(
+    inferToolCall("custom.read", { path: "/work/b" }, "/work/a"),
+    { hints: [], effects: [] },
+  );
+});
+
+test("effect inference rejects unsafe syntax, cwd conflicts, and unsupported options", () => {
+  for (const command of [
+    "cd $TARGET && git status",
+    "cd $(pwd) && git status",
+    "cd ../* && git status",
+    "cd ~/repo && git status",
+    "cd ../b && git status > /tmp/out",
+    "cd ../b && git status | cat",
+    "cd ../b && (git status)",
+    "cd ../b; git status",
+    "cd ../b && cd ../c",
+    "cd ../b && git -C . switch feature",
+    "git -C ../b -C ../c switch feature",
+    "git worktree add -b feature ../b",
+    "git config --get remote.origin.url",
+    "gh pr create --repo acme/widget",
+    "gh pr create -Racme/widget",
+    "cd ../b && gh pr create --repo acme/widget",
+    "cd ../b && npm\0 test",
+  ]) {
+    assert.deepEqual(inferBashCommand(command, "/work/a"), {
+      hints: [],
+      effects: [],
+    }, command);
+  }
+  assert.deepEqual(inferBashCommand("gh pr list", "/work/a"), {
+    hints: [],
+    effects: [],
+  });
+  assert.deepEqual(
+    inferBashCommand("git config remote.origin.url git@github.com:acme/widget.git", "/work/a"),
+    {
+      hints: [{ path: "/work/a", source: "bash" }],
+      effects: [{ kind: "git-mutation", rootPath: "/work/a" }],
+    },
+  );
 });
 
 test("parses common GitHub remote forms", () => {
@@ -132,6 +221,151 @@ test("gh lookup always selects an explicit repository with safe argv", async () 
       "--limit", "1", "--json", "number,state,isDraft,url",
     ],
   });
+});
+
+test("PR query fingerprints normalize repository case without losing tuple boundaries", () => {
+  const fingerprint = pullRequestQueryFingerprint({
+    repository: { owner: "Acme", repo: "Widget" },
+    branch: "feature/Footer",
+  });
+  assert.equal(
+    fingerprint,
+    pullRequestQueryFingerprint({
+      repository: { owner: "acme", repo: "widget" },
+      branch: "feature/Footer",
+    }),
+  );
+  assert.notEqual(
+    fingerprint,
+    pullRequestQueryFingerprint({
+      repository: { owner: "acme", repo: "widget" },
+      branch: "feature/footer",
+    }),
+  );
+  assert.notEqual(
+    pullRequestQueryFingerprint({
+      repository: { owner: "acme-a", repo: "b" },
+      branch: "main",
+    }),
+    pullRequestQueryFingerprint({
+      repository: { owner: "acme", repo: "a-b" },
+      branch: "main",
+    }),
+  );
+  assert.throws(
+    () => pullRequestQueryFingerprint({
+      repository: { owner: "-invalid", repo: "widget" },
+      branch: "main",
+    }),
+    /invalid pull request query identity/u,
+  );
+});
+
+test("PR lookup cache keeps no-PR results for 60 seconds and errors for 10 seconds", async () => {
+  let now = 0;
+  const calls: string[] = [];
+  const lookup = new CachedPullRequestLookup(
+    {
+      async findOpenPullRequest(_repository, branch) {
+        calls.push(branch);
+        if (branch === "error") throw new Error("gh unavailable");
+        return undefined;
+      },
+    },
+    { now: () => now },
+  );
+  const repository = { owner: "acme", repo: "widget" };
+
+  assert.equal(await lookup.findOpenPullRequest(repository, "none"), undefined);
+  assert.equal(await lookup.findOpenPullRequest(repository, "none"), undefined);
+  now = 59_999;
+  assert.equal(await lookup.findOpenPullRequest(repository, "none"), undefined);
+  assert.equal(calls.filter((branch) => branch === "none").length, 1);
+  now = 60_000;
+  assert.equal(await lookup.findOpenPullRequest(repository, "none"), undefined);
+  assert.equal(calls.filter((branch) => branch === "none").length, 2);
+
+  await assert.rejects(
+    lookup.findOpenPullRequest(repository, "error"),
+    /gh unavailable/u,
+  );
+  await assert.rejects(
+    lookup.findOpenPullRequest(repository, "error"),
+    /gh unavailable/u,
+  );
+  now = 69_999;
+  await assert.rejects(
+    lookup.findOpenPullRequest(repository, "error"),
+    /gh unavailable/u,
+  );
+  assert.equal(calls.filter((branch) => branch === "error").length, 1);
+  now = 70_000;
+  await assert.rejects(
+    lookup.findOpenPullRequest(repository, "error"),
+    /gh unavailable/u,
+  );
+  assert.equal(calls.filter((branch) => branch === "error").length, 2);
+});
+
+test("PR cache invalidation prevents an older in-flight lookup from restoring stale data", async () => {
+  let releaseOlder: (() => void) | undefined;
+  let markOlderStarted: (() => void) | undefined;
+  const olderStarted = new Promise<void>((resolve) => {
+    markOlderStarted = resolve;
+  });
+  let calls = 0;
+  const lookup = new CachedPullRequestLookup({
+    async findOpenPullRequest(_repository, branch) {
+      calls += 1;
+      if (calls === 1) {
+        markOlderStarted?.();
+        await new Promise<void>((resolve) => {
+          releaseOlder = resolve;
+        });
+        return {
+          number: 1,
+          state: "OPEN",
+          isDraft: false,
+          url: "https://example/old",
+        };
+      }
+      assert.equal(branch, "feature/cache");
+      return {
+        number: 2,
+        state: "OPEN",
+        isDraft: false,
+        url: "https://example/current",
+      };
+    },
+  });
+  const repository = { owner: "acme", repo: "widget" };
+  const older = lookup.findOpenPullRequest(repository, "feature/cache");
+  await olderStarted;
+  lookup.invalidate({ repository, branch: "feature/cache" });
+  releaseOlder?.();
+  assert.equal((await older)?.number, 1);
+  assert.equal((await lookup.findOpenPullRequest(repository, "feature/cache"))?.number, 2);
+  assert.equal(calls, 2);
+});
+
+test("PR lookup cache evicts old query identities at its configured bound", async () => {
+  let calls = 0;
+  const lookup = new CachedPullRequestLookup(
+    {
+      async findOpenPullRequest() {
+        calls += 1;
+        return undefined;
+      },
+    },
+    { maxEntries: 2 },
+  );
+  const repository = { owner: "acme", repo: "widget" };
+
+  await lookup.findOpenPullRequest(repository, "one");
+  await lookup.findOpenPullRequest(repository, "two");
+  await lookup.findOpenPullRequest(repository, "three");
+  await lookup.findOpenPullRequest(repository, "one");
+  assert.equal(calls, 4);
 });
 
 test("cache is bounded and negative entries expire sooner", () => {
@@ -540,6 +774,123 @@ test("metadata loader degrades safely for local-only, detached, and failed gh lo
   assert.equal(ghCalls, 1);
 });
 
+test("local identity invalidation reuses only the matching PR query", async () => {
+  let identityReads = 0;
+  let identity: LocalRepositoryIdentity = {
+    root: "/repo",
+    name: "widget",
+    ref: { name: "main", detached: false },
+    github: { owner: "acme", repo: "widget" },
+  };
+  const ghCalls: string[] = [];
+  const repositories: RepositoryInspector = {
+    async findRoot() {
+      return discovery("/repo");
+    },
+    async validateRoot() {
+      return discovery("/repo");
+    },
+    async readIdentity() {
+      identityReads += 1;
+      return identity;
+    },
+  };
+  const loader = new DefaultRepositoryMetadataLoader(repositories, {
+    async findOpenPullRequest(repository, branch) {
+      ghCalls.push(`${repository.owner}/${repository.repo}:${branch}`);
+      if (repository.repo !== "widget") return undefined;
+      return {
+        number: branch === "main" ? 1 : 2,
+        state: "OPEN",
+        isDraft: false,
+        url: `https://example/${branch}`,
+      };
+    },
+  });
+  const core = new ContextCore({ repositories, metadata: loader });
+  const resolveMetadata = async (): Promise<RepositoryMetadata> => {
+    const outcome = await core.resolve([{ path: "/repo/file.ts", source: "file" }]);
+    assert.equal(outcome.kind, "resolved");
+    if (outcome.kind !== "resolved") throw new Error("expected resolved metadata");
+    return outcome.metadata;
+  };
+
+  assert.equal((await resolveMetadata()).pullRequest?.number, 1);
+  assert.equal((await resolveMetadata()).pullRequest?.number, 1);
+  assert.equal(identityReads, 1);
+  assert.equal(ghCalls.length, 1);
+
+  core.invalidateLocalIdentity("/repo");
+  assert.equal((await resolveMetadata()).pullRequest?.number, 1);
+  assert.equal(identityReads, 2);
+  assert.equal(ghCalls.length, 1);
+
+  identity = { ...identity, ref: { name: "feature/cache", detached: false } };
+  core.invalidateLocalIdentity("/repo");
+  assert.equal((await resolveMetadata()).pullRequest?.number, 2);
+  assert.equal(ghCalls.length, 2);
+
+  identity = {
+    ...identity,
+    name: "other",
+    github: { owner: "acme", repo: "other" },
+  };
+  core.invalidateLocalIdentity("/repo");
+  assert.equal((await resolveMetadata()).pullRequest, undefined);
+  assert.equal(ghCalls.length, 3);
+
+  identity = {
+    ...identity,
+    name: "widget",
+    github: { owner: "acme", repo: "widget" },
+  };
+  core.invalidateLocalIdentity("/repo");
+  assert.equal((await resolveMetadata()).pullRequest?.number, 2);
+  assert.equal(ghCalls.length, 3);
+
+  identity = { ...identity, ref: { name: "main", detached: false } };
+  core.invalidateRepository("/repo");
+  assert.equal((await resolveMetadata()).pullRequest?.number, 1);
+  assert.equal(identityReads, 6);
+  assert.equal(ghCalls.length, 4);
+});
+
+test("PR mutation invalidation derives the root's current query identity", async () => {
+  let branch = "main";
+  const calls: string[] = [];
+  const repositories: RepositoryInspector = {
+    async findRoot() {
+      return discovery("/repo");
+    },
+    async validateRoot() {
+      return discovery("/repo");
+    },
+    async readIdentity(root) {
+      return {
+        ...metadata,
+        root,
+        ref: { name: branch, detached: false },
+      };
+    },
+  };
+  const loader = new DefaultRepositoryMetadataLoader(repositories, {
+    async findOpenPullRequest(_repository, head) {
+      calls.push(head);
+      return undefined;
+    },
+  });
+  const core = new ContextCore({ repositories, metadata: loader });
+  const hints = [{ path: "/repo", source: "file" as const }];
+
+  await core.resolve(hints);
+  branch = "feature/current";
+  core.invalidateLocalIdentity("/repo");
+  await core.resolve(hints);
+  await core.reconcile(hints, { pullRequestPaths: ["/repo"], sequence: 1 });
+
+  assert.deepEqual(calls, ["main", "feature/current", "feature/current"]);
+});
+
 test("gh lookup distinguishes no PR from command and response failures", async () => {
   const noPullRequest = new GhPullRequestLookup({
     async run() {
@@ -653,6 +1004,118 @@ test("context converts metadata failures to unavailable outcomes", async () => {
     reason: "git disappeared",
     root: "/repo",
   });
+});
+
+test("late discovery cannot repopulate a path cache after reconciliation", async () => {
+  let discoveryCalls = 0;
+  let releaseOlder: (() => void) | undefined;
+  let markOlderStarted: (() => void) | undefined;
+  const olderStarted = new Promise<void>((resolve) => {
+    markOlderStarted = resolve;
+  });
+  const repositories: RepositoryInspector = {
+    async findRoot() {
+      discoveryCalls += 1;
+      if (discoveryCalls === 1) {
+        markOlderStarted?.();
+        await new Promise<void>((resolve) => {
+          releaseOlder = resolve;
+        });
+        return discovery("/repo/old");
+      }
+      return discovery("/repo/new");
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      return metadataForRoot(root);
+    },
+  };
+  const metadataForRoot = (root: string): RepositoryMetadata => ({
+    ...metadata,
+    root,
+    name: root.endsWith("old") ? "old" : "new",
+    github: { owner: "acme", repo: root.endsWith("old") ? "old" : "new" },
+  });
+  const core = new ContextCore({
+    repositories,
+    metadata: {
+      async load(root) {
+        return { metadata: metadataForRoot(root), polarity: "positive" };
+      },
+    },
+  });
+  const hints = [{ path: "/work/target", source: "file" as const }];
+
+  const older = core.resolve(hints);
+  await olderStarted;
+  const reconciled = await core.reconcile(hints, { sequence: 2 });
+  assert.equal(reconciled.kind, "resolved");
+  if (reconciled.kind === "resolved") assert.equal(reconciled.metadata.root, "/repo/new");
+
+  releaseOlder?.();
+  await older;
+  const current = await core.resolve(hints);
+  assert.equal(current.kind, "resolved");
+  if (current.kind === "resolved") assert.equal(current.metadata.root, "/repo/new");
+  assert.equal(discoveryCalls, 2);
+});
+
+test("late metadata cannot repopulate an invalidated repository snapshot", async () => {
+  let loads = 0;
+  let releaseOlder: (() => void) | undefined;
+  let markOlderStarted: (() => void) | undefined;
+  const olderStarted = new Promise<void>((resolve) => {
+    markOlderStarted = resolve;
+  });
+  const repositories: RepositoryInspector = {
+    async findRoot() {
+      return discovery("/repo");
+    },
+    async validateRoot() {
+      return discovery("/repo");
+    },
+    async readIdentity(root) {
+      return metadataForBranch(root, "main");
+    },
+  };
+  const metadataForBranch = (root: string, branch: string): RepositoryMetadata => ({
+    ...metadata,
+    root,
+    ref: { name: branch, detached: false },
+  });
+  const core = new ContextCore({
+    repositories,
+    metadata: {
+      async load(root) {
+        loads += 1;
+        if (loads === 1) {
+          markOlderStarted?.();
+          await new Promise<void>((resolve) => {
+            releaseOlder = resolve;
+          });
+          return { metadata: metadataForBranch(root, "old"), polarity: "positive" };
+        }
+        return { metadata: metadataForBranch(root, "new"), polarity: "positive" };
+      },
+    },
+  });
+  const hints = [{ path: "/repo", source: "file" as const }];
+
+  const older = core.resolve(hints);
+  await olderStarted;
+  core.invalidateLocalIdentity("/repo");
+  const current = await core.resolve(hints);
+  assert.equal(current.kind, "resolved");
+  if (current.kind === "resolved") assert.equal(current.metadata.ref.name, "new");
+
+  releaseOlder?.();
+  await older;
+  const cached = await core.resolve(hints);
+  assert.equal(cached.kind, "resolved");
+  if (cached.kind === "resolved") assert.equal(cached.metadata.ref.name, "new");
+  assert.equal(loads, 2);
 });
 
 test("git discovery walks to an existing ancestor for nested write targets", async () => {

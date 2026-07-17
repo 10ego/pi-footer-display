@@ -39,19 +39,25 @@ Age is compact wall-clock time: seconds under one minute, whole minutes under on
 
 The extension resolves repository evidence in this priority order:
 
-1. Paths passed to Pi's `read`, `write`, `edit`, `grep`, `find`, or `ls` tools. Relative paths are resolved against Pi's current working directory.
-2. Conservative absolute-path hints from simple `bash` calls: `git -C /absolute/path ...`, one absolute operand to a small path-oriented command allowlist, or `cd /absolute/path && <one simple command>`.
+1. Paths passed to Pi's `read`, `write`, `edit`, `grep`, `find`, or `ls` tools. Relative paths are resolved against Pi's session working directory.
+2. Deterministic paths from a deliberately small set of literal `bash` forms:
+   - `git -C <path> ...`, where `<path>` may be absolute or relative;
+   - `cd <path> && <one simple command>`, where `<path>` may be absolute or relative;
+   - exact `git worktree add <destination> [<commit-ish>]` commands;
+   - one absolute operand to a small path-oriented command allowlist.
 3. The session's startup working directory as a weak startup fallback.
 
-Observed tool calls are grouped over a 100 ms debounce window. Within the strongest evidence tier that resolves to repositories:
+Ordinary path hints are grouped over a 100 ms debounce window. Within the strongest evidence tier that resolves to repositories:
 
 - one canonical Git root is selected;
 - multiple roots produce `repo? N · ?` instead of guessing;
 - paths confirmed to be outside a repository are ignored, and unrelated non-repository activity does not discard the last confirmed root;
 - an indeterminate discovery failure publishes unavailable context instead of being treated as “not a repository”;
-- if activity resolves to repository B but B's local metadata cannot be read, the footer publishes unavailable context for B rather than continuing to show repository A.
+- if activity resolves to repository B but B's local metadata cannot be read, the footer publishes unavailable B context rather than continuing to show repository A.
 
-File-tool evidence outranks bash evidence, and the startup fallback cannot override either. Shell pipelines, substitutions, redirections, relative bash paths, multiple absolute operands, and other complex shell forms are intentionally not treated as repository signals. Pinned mode ignores all automatic evidence until it is unpinned.
+Commands that can change the displayed Git identity—supported `git switch`, `checkout`, branch/remote/config/worktree mutations, `gh pr checkout`, and selected `gh pr` mutations—are handled after Pi emits `tool_result`, whether the command reports success or failure. This catches partial side effects and worktrees that did not exist before execution. Call-order sequence and generation guards prevent late older work from replacing newer context. If a recognized effect has no matching result, `agent_settled` performs one final coalesced local reconciliation; clean runs do no such work.
+
+File-tool evidence outranks bash evidence, and the startup fallback cannot override either. Expansions, substitutions, globs, tilde expansion, redirects, pipes, subshells, multiple directory changes, unsupported options, and conflicting paths are intentionally rejected rather than guessed. Pinned mode never changes roots from automatic evidence, although a recognized mutation inside the pinned worktree refreshes its branch and PR metadata.
 
 ## Commands
 
@@ -85,6 +91,12 @@ Consequences:
 - a system clock earlier than `startedAt` displays `0s` rather than a negative age.
 
 Restored roots are revalidated and canonicalized with structured results. A confirmed deleted or non-repository pin may downgrade to automatic mode and fall back to a valid last-confirmed root, then the startup directory. An indeterminate failure—missing or timed-out Git, permission or realpath failure, or another process error—preserves `mode=pinned`, `pinnedRoot`, `lastConfirmedRoot`, and `startedAt`, publishes stale/unavailable status, and does not persist an automatic-mode downgrade.
+
+### `/new` and the session working directory
+
+Pi emits a new session lifecycle when `/new` is used, so the footer is cleared and initialized again. However, Pi 0.80.7 through 0.80.10 deliberately reuse the existing runtime working directory for the new session. `/new` therefore does not by itself select another worktree.
+
+In automatic mode, the footer follows the first supported path or shell signal for the other worktree. If the work happens through an opaque custom tool or unsupported shell expression, start Pi in that worktree or use `/pr-footer pin <path>`. Pi currently exposes neither an authoritative `cwd_changed` extension event nor a `newSession({ cwd })` option.
 
 ## Prerequisites
 
@@ -143,22 +155,23 @@ pi --extension ./src/index.ts
 
 ## Cache and subprocess behavior
 
-Repository discovery and metadata are deliberately bounded:
+Repository discovery, local snapshots, and pull-request results are deliberately bounded:
 
 | Cache | Maximum entries | Successful result TTL | Negative/degraded result TTL |
 | --- | ---: | ---: | ---: |
 | Candidate path → Git root | 128 | 5 minutes | 30 seconds |
-| Git root → repository/PR metadata | 32 | 60 seconds | 10 seconds |
+| Git root → rendered metadata snapshot | 32 | 60 seconds | 10 seconds |
+| Exact GitHub repository + branch → PR/no PR | 32 | 60 seconds | 10-second error backoff |
 
-Least-recently-used-ish entries are evicted when a cache exceeds its bound. Only confirmed repository and non-repository discovery results are cached; indeterminate Git, filesystem, realpath, and process failures are not. All degraded metadata—detached HEAD, no recognized GitHub remote, or unavailable GitHub lookup—uses the shorter 10-second metadata TTL; a successful lookup with no open PR is a positive result. `/pr-footer refresh` invalidates the relevant entries. The once-per-second age redraw only reformats existing state; it does not invoke Git, `gh`, or network access.
+Least-recently-used-ish entries are evicted when a cache exceeds its bound. Only confirmed repository and non-repository discovery results are cached; indeterminate Git, filesystem, realpath, and process failures are not. Recognized Git effects invalidate the affected local snapshot immediately. On a PR-cache miss, the new local branch is published first with `!` and no previous PR, then enriched only if the matching `gh` result is still current. A matching PR/no-PR result may be reused for the same repository and branch, while a changed repository or branch uses a different query key and cannot inherit the previous PR. Recognized `gh pr` mutations invalidate the affected query. `/pr-footer refresh` bypasses local and PR cache state so unobserved changes can be rechecked.
 
-Every `git` and `gh` operation is launched directly without a shell, has a 10-second timeout, and accepts at most 1 MiB of output. GitHub lookup uses an explicit target rather than ambient repository inference:
+The once-per-second age redraw only reformats existing state. A clean `agent_settled` event also performs no Git, `gh`, or network work. Every `git` and `gh` operation is launched directly without a shell, has a 10-second timeout, and accepts at most 1 MiB of output. GitHub lookup uses an explicit target rather than ambient repository inference:
 
 ```bash
 gh pr list --repo OWNER/REPO --head BRANCH --state open --limit 1 --json number,state,isDraft,url
 ```
 
-Network access occurs only through `gh` when a recognized `github.com` remote and an attached branch are being resolved. Startup, a confirmed automatic repository change, pinning, and explicit refresh can trigger that lookup when the metadata cache does not satisfy it.
+Network access occurs only through `gh` when a recognized `github.com` remote and attached branch require a PR query. Startup, a confirmed automatic repository change, a branch/repository identity change, a recognized PR mutation, pinning, and explicit refresh can trigger that lookup when the exact query cache does not satisfy it.
 
 ## Graceful degradation
 
@@ -219,9 +232,15 @@ Automatic tracking reflects the strongest recent tool-path evidence, including m
 
 Use `/pr-footer unpin` when automatic switching is wanted again.
 
+### The footer stays on the previous worktree after `/new`
+
+`/new` starts a fresh Pi session but retains Pi's existing runtime working directory. The footer changes after a supported tool path or deterministic shell form identifies the other worktree. Check the current selection with `/pr-footer status`; when inference cannot observe the move, use `/pr-footer pin /absolute/path/to/worktree`.
+
+An agent run ending is not a general polling trigger. `agent_settled` performs a local check only when a recognized Git-affecting command is still pending or previously failed to reconcile.
+
 ### PR data is old
 
-Successful metadata can remain cached for up to 60 seconds. Run `/pr-footer refresh` for an immediate re-query.
+Successful PR and no-PR results can remain cached for up to 60 seconds. Recognized branch/repository changes use a new query automatically, and recognized `gh pr` mutations invalidate the affected query. Run `/pr-footer refresh` to bypass caches immediately.
 
 ### Session age is larger than active work time
 
@@ -231,9 +250,10 @@ This is expected after resuming: age is persisted wall-clock session age and inc
 
 - Only `github.com` remotes with exactly `OWNER/REPO` paths are recognized; GitHub Enterprise and other forges receive local-only context.
 - PR matching is branch-based and displays only the first open result returned by `gh --limit 1`.
-- Automatic tracking intentionally recognizes only `read`, `write`, `edit`, `grep`, `find`, `ls`, and narrow bash path forms; other tools and complex commands do not influence selection.
+- Automatic tracking intentionally recognizes only `read`, `write`, `edit`, `grep`, `find`, `ls`, and narrow deterministic bash forms; opaque custom tools, external filesystem activity, and complex shell commands do not influence selection.
+- Pi currently has no authoritative dynamic-cwd event and `/new` cannot request another cwd, so arbitrary logical directory changes cannot be detected reliably by an extension.
 - The footer shows repository, ref, optional PR number/draft state, degradation markers, and age only. It does not show PR title, checks, review state, or ahead/behind counts.
-- Cache TTLs trade freshness for bounded local and network work; use `/pr-footer refresh` when immediate freshness matters.
+- Remote PR changes not caused by a recognized local command may remain cached for up to 60 seconds; use `/pr-footer refresh` when immediate freshness matters.
 
 ## Development
 

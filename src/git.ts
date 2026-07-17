@@ -1,5 +1,6 @@
 import path from "node:path";
 import { realpath, stat } from "node:fs/promises";
+import { isValidGitHubRepository } from "./github.js";
 import { ProcessExecutionError, type CommandRunner } from "./process.js";
 import type {
   GitHubRepository,
@@ -79,14 +80,9 @@ export function parseGitHubRemote(remote: string): GitHubRepository | undefined 
   const repoPart = parts[1];
   if (!owner || !repoPart) return undefined;
   const repo = repoPart.replace(/\.git$/iu, "");
+  const repository = { owner, repo };
   // Reject encoded separators and URL-shaped lookalikes before passing a slug to gh.
-  if (
-    !/^(?!-)[A-Za-z0-9-]{1,39}(?<!-)$/u.test(owner) ||
-    !/^(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}$/u.test(repo)
-  ) {
-    return undefined;
-  }
-  return { owner, repo };
+  return isValidGitHubRepository(repository) ? repository : undefined;
 }
 
 export class GitRepositoryInspector implements RepositoryInspector {
