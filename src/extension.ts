@@ -594,12 +594,14 @@ export class FooterExtensionRuntime {
     hints: readonly PathHint[],
     pullRequestPaths: readonly string[],
     sequence: number,
+    onLocalIdentity?: (metadata: Extract<ResolutionOutcome, { kind: "resolved" }>["metadata"]) => void,
   ): Promise<ResolutionOutcome> {
     try {
       return this.#dependencies
         ? await this.#dependencies.core.reconcile(hints, {
             pullRequestPaths,
             sequence,
+            ...(onLocalIdentity ? { onLocalIdentity } : {}),
           })
         : { kind: "unavailable", reason: "footer is not initialized" };
     } catch (error) {
@@ -670,26 +672,51 @@ export class FooterExtensionRuntime {
     }
 
     const generation = canPublish ? controller.beginRefresh() : undefined;
-    const outcome = await this.#safeReconcile(hints, pullRequestPaths, sequence);
+    const publishLocalIdentity = generation === undefined
+      ? undefined
+      : (metadata: Extract<ResolutionOutcome, { kind: "resolved" }>["metadata"]): void => {
+          if (
+            this.#active(lifecycle) &&
+            this.#reconciliationCanPublish(mode, pinnedRoot, sequence)
+          ) {
+            this.#commitOutcome(
+              { kind: "resolved", metadata },
+              lifecycle,
+              generation,
+            );
+          }
+        };
+    const outcome = await this.#safeReconcile(
+      hints,
+      pullRequestPaths,
+      sequence,
+      publishLocalIdentity,
+    );
     if (!this.#active(lifecycle)) return;
     if (finalBarrier || outcome.kind !== "unavailable") {
       this.#completeEffects(effects);
     }
-    if (!canPublish || generation === undefined) return;
-    if (mode === "pinned") {
-      if (
-        controller.state.mode !== "pinned" ||
-        controller.state.pinnedRoot !== pinnedRoot
-      ) {
-        return;
-      }
-    } else if (
-      controller.state.mode !== "auto" ||
-      sequence < this.#latestSelectionSequence
+    if (
+      !canPublish ||
+      generation === undefined ||
+      !this.#reconciliationCanPublish(mode, pinnedRoot, sequence)
     ) {
       return;
     }
     this.#commitOutcome(outcome, lifecycle, generation);
+  }
+
+  #reconciliationCanPublish(
+    mode: SessionMode,
+    pinnedRoot: string | undefined,
+    sequence: number,
+  ): boolean {
+    const state = this.#controller?.state;
+    if (!state) return false;
+    if (mode === "pinned") {
+      return state.mode === "pinned" && state.pinnedRoot === pinnedRoot;
+    }
+    return state.mode === "auto" && sequence >= this.#latestSelectionSequence;
   }
 
   async #trackReconciliation(work: Promise<void>): Promise<void> {

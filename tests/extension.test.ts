@@ -542,6 +542,80 @@ test("git and gh effects reconcile only after tool_result without retaining an o
   runtime.shutdown(ctx);
 });
 
+test("a changed local identity replaces the old PR before the new PR query finishes", async (t) => {
+  const harness = createHarness();
+  let branch = "main";
+  let finishFeatureLookup: (() => void) | undefined;
+  let markFeatureLookupStarted: (() => void) | undefined;
+  const featureLookupStarted = new Promise<void>((resolve) => {
+    markFeatureLookupStarted = resolve;
+  });
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      return discovery(
+        candidate === "/repo/a" || candidate.startsWith("/repo/a/")
+          ? "/repo/a"
+          : null,
+      );
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      return {
+        root,
+        name: "widget",
+        ref: { name: branch, detached: false },
+        github: { owner: "acme", repo: "widget" },
+      };
+    },
+  };
+  const loader = new DefaultRepositoryMetadataLoader(repositories, {
+    async findOpenPullRequest(_repository, head) {
+      if (head === "main") {
+        return {
+          number: 1,
+          state: "OPEN",
+          isDraft: false,
+          url: "https://example/1",
+        };
+      }
+      markFeatureLookupStarted?.();
+      await new Promise<void>((resolve) => {
+        finishFeatureLookup = resolve;
+      });
+      return undefined;
+    },
+  });
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({ repositories, metadata: loader }),
+    }),
+    debounceMs: 5,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness, { cwd: "/repo/a" });
+  t.after(() => runtime.shutdown(ctx));
+  await runtime.start(ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /main · PR #1/u);
+
+  branch = "feature/local-first";
+  const call = bashCall("git switch feature/local-first", "local-first");
+  runtime.observeToolCall(call, ctx);
+  const reconciling = runtime.observeToolResult(resultFor(call), ctx);
+  await featureLookupStarted;
+
+  assert.match(harness.statuses.at(-1)?.text ?? "", /feature\/local-first/u);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /!/u);
+  assert.doesNotMatch(harness.statuses.at(-1)?.text ?? "", /PR #1/u);
+
+  finishFeatureLookup?.();
+  await reconciling;
+  assert.match(harness.statuses.at(-1)?.text ?? "", /feature\/local-first/u);
+  assert.doesNotMatch(harness.statuses.at(-1)?.text ?? "", /PR #1|!/u);
+});
+
 test("repository effects remain staged until their tool result", async (t) => {
   const harness = createHarness();
   const loadCounts = new Map<string, number>();
@@ -821,6 +895,86 @@ test("pinned mode ignores selection hints but refreshes relevant git mutations",
   await runtime.observeToolResult(resultFor(relevant), ctx);
   assert.equal(loads, loadsAfterPin + 1);
   assert.match(harness.statuses.at(-1)?.text ?? "", /^📌 acme\/a · feature\/pinned/u);
+  runtime.shutdown(ctx);
+});
+
+test("tool results wait for an active pin transition before reconciling", async () => {
+  const harness = createHarness();
+  const branches = new Map([
+    ["/repo/a", "main"],
+    ["/repo/b", "other"],
+  ]);
+  let releasePin: (() => void) | undefined;
+  let pinValidationStarted: (() => void) | undefined;
+  const validationStarted = new Promise<void>((resolve) => {
+    pinValidationStarted = resolve;
+  });
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      const root = ["/repo/a", "/repo/b"].find(
+        (value) => candidate === value || candidate.startsWith(`${value}/`),
+      );
+      if (candidate === "/repo/b" && releasePin === undefined) {
+        pinValidationStarted?.();
+        await new Promise<void>((resolve) => {
+          releasePin = resolve;
+        });
+      }
+      return discovery(root ?? null);
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      return {
+        ...metadata(root),
+        ref: { name: branches.get(root) ?? "main", detached: false },
+      };
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            return {
+              metadata: {
+                ...metadata(root),
+                ref: { name: branches.get(root) ?? "main", detached: false },
+              },
+              polarity: "positive",
+            };
+          },
+        },
+      }),
+    }),
+    debounceMs: 5,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+  await runtime.start(ctx);
+
+  const pinning = runtime.handleCommand("pin /repo/b", ctx);
+  await validationStarted;
+  branches.set("/repo/b", "feature/during-pin");
+  const call = bashCall("git -C /repo/b switch feature/during-pin", "during-pin");
+  runtime.observeToolCall(call, ctx);
+  let resultSettled = false;
+  const result = runtime.observeToolResult(resultFor(call), ctx).then(() => {
+    resultSettled = true;
+  });
+  await wait(0);
+  assert.equal(resultSettled, false);
+
+  releasePin?.();
+  await Promise.all([pinning, result]);
+  assert.equal(resultSettled, true);
+  assert.match(
+    harness.statuses.at(-1)?.text ?? "",
+    /^📌 acme\/b · feature\/during-pin/u,
+  );
   runtime.shutdown(ctx);
 });
 

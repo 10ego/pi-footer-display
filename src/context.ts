@@ -24,7 +24,10 @@ export interface MetadataLoadResult {
 }
 
 export interface RepositoryMetadataLoader {
-  load(root: string): Promise<MetadataLoadResult>;
+  load(
+    root: string,
+    onLocalIdentity?: (result: MetadataLoadResult) => void,
+  ): Promise<MetadataLoadResult>;
   /** Invalidates all network-derived data for an explicit refresh. */
   invalidate?(root: string): void;
   /** Invalidates only the last PR query associated with this root. */
@@ -37,6 +40,8 @@ export interface ContextReconciliationOptions {
   readonly pullRequestPaths?: readonly string[];
   /** Monotonic event sequence used to reject older cache invalidations. */
   readonly sequence?: number;
+  /** Publishes fresh local identity before a potentially slow PR query finishes. */
+  readonly onLocalIdentity?: (metadata: RepositoryMetadata) => void;
 }
 
 export interface DefaultRepositoryMetadataLoaderOptions {
@@ -60,7 +65,10 @@ export class DefaultRepositoryMetadataLoader implements RepositoryMetadataLoader
     );
   }
 
-  async load(root: string): Promise<MetadataLoadResult> {
+  async load(
+    root: string,
+    onLocalIdentity?: (result: MetadataLoadResult) => void,
+  ): Promise<MetadataLoadResult> {
     const identity = await this.#repositories.readIdentity(root);
     if (!identity.github) {
       this.#queriesByRoot.delete(root);
@@ -89,6 +97,10 @@ export class DefaultRepositoryMetadataLoader implements RepositoryMetadataLoader
       };
     }
     this.#rememberQuery(root, query);
+    onLocalIdentity?.({
+      metadata: { ...identity, degraded: ["github-pending"] },
+      polarity: "negative",
+    });
 
     try {
       const pullRequest = await this.#pullRequests.findOpenPullRequest(
@@ -239,6 +251,7 @@ export class ContextCore {
     for (const source of SOURCES) {
       const outcome = await this.#outcomeAtTier(
         discovered.filter((entry) => entry.hint.source === source),
+        options.onLocalIdentity,
       );
       if (outcome) return outcome;
     }
@@ -272,6 +285,7 @@ export class ContextCore {
 
   async #outcomeAtTier(
     discovered: readonly DiscoveredHint[],
+    onLocalIdentity?: (metadata: RepositoryMetadata) => void,
   ): Promise<ResolutionOutcome | undefined> {
     if (discovered.length === 0) return undefined;
     const roots = [
@@ -294,7 +308,10 @@ export class ContextCore {
     if (!root) return undefined;
 
     try {
-      return { kind: "resolved", metadata: await this.#repositoryMetadata(root) };
+      return {
+        kind: "resolved",
+        metadata: await this.#repositoryMetadata(root, onLocalIdentity),
+      };
     } catch (error) {
       return {
         kind: "unavailable",
@@ -354,11 +371,16 @@ export class ContextCore {
     return outcome;
   }
 
-  async #repositoryMetadata(root: string): Promise<RepositoryMetadata> {
+  async #repositoryMetadata(
+    root: string,
+    onLocalIdentity?: (metadata: RepositoryMetadata) => void,
+  ): Promise<RepositoryMetadata> {
     const cached = this.#metadataCache.get(root);
     if (cached) return cached.value;
     const epoch = this.#metadataEpoch;
-    const loaded = await this.#metadata.load(root);
+    const loaded = await this.#metadata.load(root, (local) => {
+      if (epoch === this.#metadataEpoch) onLocalIdentity?.(local.metadata);
+    });
     // An older async load may satisfy its caller but cannot repopulate a cache
     // invalidated by a newer event or lifecycle cleanup.
     if (epoch === this.#metadataEpoch) {
