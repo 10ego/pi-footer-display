@@ -1,7 +1,6 @@
 import { BoundedTtlCache, type CachePolarity } from "./cache.js";
 import {
   CachedPullRequestLookup,
-  PULL_REQUEST_CACHE_MAX_ENTRIES,
   isValidPullRequestQuery,
   type CachedPullRequestLookupOptions,
   type PullRequestLookup,
@@ -30,8 +29,8 @@ export interface RepositoryMetadataLoader {
   ): Promise<MetadataLoadResult>;
   /** Invalidates all network-derived data for an explicit refresh. */
   invalidate?(root: string): void;
-  /** Invalidates only the last PR query associated with this root. */
-  invalidatePullRequest?(root: string): void;
+  /** Invalidates the PR query for the root's current local identity. */
+  invalidatePullRequest?(root: string): Promise<void> | void;
   clear?(): void;
 }
 
@@ -51,7 +50,6 @@ export interface DefaultRepositoryMetadataLoaderOptions {
 export class DefaultRepositoryMetadataLoader implements RepositoryMetadataLoader {
   readonly #repositories: RepositoryInspector;
   readonly #pullRequests: CachedPullRequestLookup;
-  readonly #queriesByRoot = new Map<string, PullRequestQuery>();
 
   constructor(
     repositories: RepositoryInspector,
@@ -71,14 +69,12 @@ export class DefaultRepositoryMetadataLoader implements RepositoryMetadataLoader
   ): Promise<MetadataLoadResult> {
     const identity = await this.#repositories.readIdentity(root);
     if (!identity.github) {
-      this.#queriesByRoot.delete(root);
       return {
         metadata: { ...identity, degraded: ["no-github-remote"] },
         polarity: "negative",
       };
     }
     if (identity.ref.detached) {
-      this.#queriesByRoot.delete(root);
       return {
         metadata: { ...identity, degraded: ["detached-head"] },
         polarity: "negative",
@@ -90,13 +86,11 @@ export class DefaultRepositoryMetadataLoader implements RepositoryMetadataLoader
       branch: identity.ref.name,
     } satisfies PullRequestQuery;
     if (!isValidPullRequestQuery(query)) {
-      this.#queriesByRoot.delete(root);
       return {
         metadata: { ...identity, degraded: ["github-unavailable"] },
         polarity: "negative",
       };
     }
-    this.#rememberQuery(root, query);
     onLocalIdentity?.({
       metadata: { ...identity, degraded: ["github-pending"] },
       polarity: "negative",
@@ -124,34 +118,24 @@ export class DefaultRepositoryMetadataLoader implements RepositoryMetadataLoader
     }
   }
 
-  invalidatePullRequest(root: string): void {
-    const query = this.#queriesByRoot.get(root);
-    if (query) this.#pullRequests.invalidate(query);
+  async invalidatePullRequest(root: string): Promise<void> {
+    const identity = await this.#repositories.readIdentity(root);
+    if (!identity.github || identity.ref.detached) return;
+    const query = {
+      repository: identity.github,
+      branch: identity.ref.name,
+    } satisfies PullRequestQuery;
+    if (isValidPullRequestQuery(query)) this.#pullRequests.invalidate(query);
   }
 
   invalidate(_root: string): void {
     // Identity is read after invalidation, so explicit refresh clears every
     // bounded query entry even if the branch changed while cached.
     this.#pullRequests.clear();
-    this.#queriesByRoot.clear();
   }
 
   clear(): void {
     this.#pullRequests.clear();
-    this.#queriesByRoot.clear();
-  }
-
-  #rememberQuery(root: string, query: PullRequestQuery): void {
-    this.#queriesByRoot.delete(root);
-    this.#queriesByRoot.set(root, {
-      repository: { ...query.repository },
-      branch: query.branch,
-    });
-    while (this.#queriesByRoot.size > PULL_REQUEST_CACHE_MAX_ENTRIES) {
-      const oldest = this.#queriesByRoot.keys().next().value;
-      if (oldest === undefined) break;
-      this.#queriesByRoot.delete(oldest);
-    }
   }
 }
 
@@ -241,7 +225,7 @@ export class ContextCore {
       this.#invalidateLocal(root);
       if (refreshPullRequest) {
         if (this.#metadata.invalidatePullRequest) {
-          this.#metadata.invalidatePullRequest(root);
+          await this.#metadata.invalidatePullRequest(root);
         } else {
           this.#metadata.invalidate?.(root);
         }

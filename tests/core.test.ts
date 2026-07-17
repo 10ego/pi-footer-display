@@ -814,6 +814,42 @@ test("local identity invalidation reuses only the matching PR query", async () =
   assert.equal(ghCalls.length, 4);
 });
 
+test("PR mutation invalidation derives the root's current query identity", async () => {
+  let branch = "main";
+  const calls: string[] = [];
+  const repositories: RepositoryInspector = {
+    async findRoot() {
+      return discovery("/repo");
+    },
+    async validateRoot() {
+      return discovery("/repo");
+    },
+    async readIdentity(root) {
+      return {
+        ...metadata,
+        root,
+        ref: { name: branch, detached: false },
+      };
+    },
+  };
+  const loader = new DefaultRepositoryMetadataLoader(repositories, {
+    async findOpenPullRequest(_repository, head) {
+      calls.push(head);
+      return undefined;
+    },
+  });
+  const core = new ContextCore({ repositories, metadata: loader });
+  const hints = [{ path: "/repo", source: "file" as const }];
+
+  await core.resolve(hints);
+  branch = "feature/current";
+  core.invalidateLocalIdentity("/repo");
+  await core.resolve(hints);
+  await core.reconcile(hints, { pullRequestPaths: ["/repo"], sequence: 1 });
+
+  assert.deepEqual(calls, ["main", "feature/current", "feature/current"]);
+});
+
 test("gh lookup distinguishes no PR from command and response failures", async () => {
   const noPullRequest = new GhPullRequestLookup({
     async run() {

@@ -633,7 +633,7 @@ export class FooterExtensionRuntime {
     let canPublish: boolean;
 
     if (mode === "pinned" && pinnedRoot) {
-      relevantEffects = effects.filter((effect) => this.#effectTouchesRoot(effect, pinnedRoot));
+      relevantEffects = await this.#effectsTouchRoot(effects, pinnedRoot);
       if (relevantEffects.length === 0) {
         this.#completeEffects(effects);
         return;
@@ -645,10 +645,13 @@ export class FooterExtensionRuntime {
       )
         ? [pinnedRoot]
         : [];
+      const dirtyRelevant = await this.#effectsTouchRoot(
+        [...this.#dirtyEffects],
+        pinnedRoot,
+      );
       const latestRelevant = Math.max(
-        ...[...this.#dirtyEffects]
-          .filter((effect) => this.#effectTouchesRoot(effect, pinnedRoot))
-          .map((effect) => effect.sequence),
+        sequence,
+        ...dirtyRelevant.map((effect) => effect.sequence),
       );
       canPublish = sequence >= latestRelevant;
     } else {
@@ -696,6 +699,7 @@ export class FooterExtensionRuntime {
     if (finalBarrier || outcome.kind !== "unavailable") {
       this.#completeEffects(effects);
     }
+    if (outcome.kind === "no-repository" && this.#lastConfirmedRoot) return;
     if (
       !canPublish ||
       generation === undefined ||
@@ -752,11 +756,28 @@ export class FooterExtensionRuntime {
     for (const resolve of waiters) resolve();
   }
 
-  #effectTouchesRoot(effect: RepositoryEffect, root: string): boolean {
-    return (
-      this.#pathWithin(root, effect.rootPath) ||
-      (effect.destinationPath !== undefined && this.#pathWithin(root, effect.destinationPath))
-    );
+  async #effectsTouchRoot(
+    effects: readonly StagedRepositoryEffect[],
+    root: string,
+  ): Promise<StagedRepositoryEffect[]> {
+    const matching = await Promise.all(effects.map(async (effect) => ({
+      effect,
+      touches: await this.#effectTouchesRoot(effect, root),
+    })));
+    return matching
+      .filter((entry) => entry.touches)
+      .map((entry) => entry.effect);
+  }
+
+  async #effectTouchesRoot(effect: RepositoryEffect, root: string): Promise<boolean> {
+    const candidates = [effect.rootPath, effect.destinationPath]
+      .filter((candidate): candidate is string => candidate !== undefined);
+    if (candidates.some((candidate) => this.#pathWithin(root, candidate))) return true;
+    for (const candidate of candidates) {
+      const outcome = await this.#validateRoot(candidate);
+      if (outcome.kind === "repository" && outcome.root === root) return true;
+    }
+    return false;
   }
 
   #pathWithin(root: string, candidate: string): boolean {

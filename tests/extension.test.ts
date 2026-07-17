@@ -616,6 +616,77 @@ test("a changed local identity replaces the old PR before the new PR query finis
   assert.doesNotMatch(harness.statuses.at(-1)?.text ?? "", /PR #1|!/u);
 });
 
+test("an unrelated failed effect preserves the confirmed automatic repository", async (t) => {
+  const harness = createHarness();
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: dependencies,
+    debounceMs: 5,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+  t.after(() => runtime.shutdown(ctx));
+  await runtime.start(ctx);
+  const call = bashCall("git -C /outside switch topic", "outside-effect");
+  runtime.observeToolCall(call, ctx);
+  await runtime.observeToolResult(resultFor(call, true), ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/a/u);
+});
+
+test("a pinned root refreshes through a symlinked git effect path", async (t) => {
+  const harness = createHarness();
+  let branch = "main";
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      if (candidate === "/real/repo" || candidate.startsWith("/real/repo/")) {
+        return discovery("/real/repo");
+      }
+      if (candidate === "/link/repo" || candidate.startsWith("/link/repo/")) {
+        return discovery("/real/repo");
+      }
+      return discovery(null);
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      return {
+        ...metadata(root),
+        ref: { name: branch, detached: false },
+      };
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            return {
+              metadata: {
+                ...metadata(root),
+                ref: { name: branch, detached: false },
+              },
+              polarity: "positive",
+            };
+          },
+        },
+      }),
+    }),
+    debounceMs: 5,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness, { cwd: "/real/repo" });
+  t.after(() => runtime.shutdown(ctx));
+  await runtime.start(ctx);
+  await runtime.handleCommand("pin /real/repo", ctx);
+  branch = "feature/symlink";
+  const call = bashCall("git -C /link/repo switch feature/symlink", "symlink-effect");
+  runtime.observeToolCall(call, ctx);
+  await runtime.observeToolResult(resultFor(call), ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^📌 acme\/repo · feature\/symlink/u);
+});
+
 test("repository effects remain staged until their tool result", async (t) => {
   const harness = createHarness();
   const loadCounts = new Map<string, number>();
