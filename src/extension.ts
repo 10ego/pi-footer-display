@@ -185,6 +185,8 @@ export class FooterExtensionRuntime {
   #latestSelectionSequence = 0;
   #dirtyEpoch = 0;
   #settledEpoch = 0;
+  #pinnedValidationEpoch = -1;
+  #pinnedRootValidations = new Map<string, Promise<RepositoryDiscoveryOutcome>>();
 
   constructor(pi: ExtensionAPI, options: FooterExtensionOptions = {}) {
     this.#pi = pi;
@@ -635,7 +637,7 @@ export class FooterExtensionRuntime {
     let canPublish: boolean;
 
     if (mode === "pinned" && pinnedRoot) {
-      const rootValidations = new Map<string, Promise<RepositoryDiscoveryOutcome>>();
+      const rootValidations = this.#pinnedValidationsForDirtyEpoch();
       relevantEffects = await this.#effectsTouchRoot(
         effects,
         pinnedRoot,
@@ -762,6 +764,14 @@ export class FooterExtensionRuntime {
     const waiters = [...this.#transitionWaiters];
     this.#transitionWaiters.clear();
     for (const resolve of waiters) resolve();
+  }
+
+  #pinnedValidationsForDirtyEpoch(): Map<string, Promise<RepositoryDiscoveryOutcome>> {
+    if (this.#pinnedValidationEpoch !== this.#dirtyEpoch) {
+      this.#pinnedValidationEpoch = this.#dirtyEpoch;
+      this.#pinnedRootValidations.clear();
+    }
+    return this.#pinnedRootValidations;
   }
 
   async #effectsTouchRoot(
@@ -962,6 +972,8 @@ export class FooterExtensionRuntime {
     this.#latestSelectionSequence = 0;
     this.#dirtyEpoch = 0;
     this.#settledEpoch = 0;
+    this.#pinnedValidationEpoch = -1;
+    this.#pinnedRootValidations.clear();
     if (this.#ageTimer) clearInterval(this.#ageTimer);
     this.#ageTimer = undefined;
     this.#clearPendingHints();

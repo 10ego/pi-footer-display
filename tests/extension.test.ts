@@ -691,6 +691,81 @@ test("a pinned root refreshes through a symlinked git effect path once", async (
   assert.equal(symlinkLookups, beforeEffect + 1);
 });
 
+test("concurrent pinned alias effects share validation for their dirty epoch", async (t) => {
+  const harness = createHarness();
+  let branch = "main";
+  let symlinkLookups = 0;
+  let releaseLookup: (() => void) | undefined;
+  let markLookupStarted: (() => void) | undefined;
+  const lookupStarted = new Promise<void>((resolve) => {
+    markLookupStarted = resolve;
+  });
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      if (candidate === "/real/repo" || candidate.startsWith("/real/repo/")) {
+        return discovery("/real/repo");
+      }
+      if (candidate === "/link/repo" || candidate.startsWith("/link/repo/")) {
+        symlinkLookups += 1;
+        markLookupStarted?.();
+        await new Promise<void>((resolve) => {
+          releaseLookup = resolve;
+        });
+        return discovery("/real/repo");
+      }
+      return discovery(null);
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      return {
+        ...metadata(root),
+        ref: { name: branch, detached: false },
+      };
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            return {
+              metadata: {
+                ...metadata(root),
+                ref: { name: branch, detached: false },
+              },
+              polarity: "positive",
+            };
+          },
+        },
+      }),
+    }),
+    debounceMs: 5,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness, { cwd: "/real/repo" });
+  t.after(() => runtime.shutdown(ctx));
+  await runtime.start(ctx);
+  await runtime.handleCommand("pin /real/repo", ctx);
+
+  branch = "feature/batch";
+  const first = bashCall("git -C /link/repo switch feature/batch", "batch-first");
+  const second = bashCall("git -C /link/repo checkout feature/batch", "batch-second");
+  runtime.observeToolCall(first, ctx);
+  runtime.observeToolCall(second, ctx);
+  const firstResult = runtime.observeToolResult(resultFor(first));
+  await lookupStarted;
+  const secondResult = runtime.observeToolResult(resultFor(second));
+  await wait(0);
+  assert.equal(symlinkLookups, 1);
+  releaseLookup?.();
+  await Promise.all([firstResult, secondResult]);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^📌 acme\/repo · feature\/batch/u);
+});
+
 test("repository effects remain staged until their tool result", async (t) => {
   const harness = createHarness();
   const loadCounts = new Map<string, number>();
