@@ -62,6 +62,7 @@ type CachedPullRequestOutcome =
 export class CachedPullRequestLookup implements PullRequestLookup {
   readonly #delegate: PullRequestLookup;
   readonly #cache: BoundedTtlCache<string, CachedPullRequestOutcome>;
+  #generation = 0;
 
   constructor(
     delegate: PullRequestLookup,
@@ -88,26 +89,33 @@ export class CachedPullRequestLookup implements PullRequestLookup {
       return cached.kind === "pull-request" ? cached.pullRequest : undefined;
     }
 
+    const generation = this.#generation;
     try {
       const pullRequest = await this.#delegate.findOpenPullRequest(repository, branch);
-      this.#cache.set(
-        fingerprint,
-        pullRequest
-          ? { kind: "pull-request", pullRequest }
-          : { kind: "no-pull-request" },
-      );
+      if (generation === this.#generation) {
+        this.#cache.set(
+          fingerprint,
+          pullRequest
+            ? { kind: "pull-request", pullRequest }
+            : { kind: "no-pull-request" },
+        );
+      }
       return pullRequest;
     } catch (error) {
-      this.#cache.set(fingerprint, { kind: "error", error }, "negative");
+      if (generation === this.#generation) {
+        this.#cache.set(fingerprint, { kind: "error", error }, "negative");
+      }
       throw error;
     }
   }
 
   invalidate(query: PullRequestQuery): void {
+    this.#generation += 1;
     this.#cache.delete(pullRequestQueryFingerprint(query));
   }
 
   clear(): void {
+    this.#generation += 1;
     this.#cache.clear();
   }
 }

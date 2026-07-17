@@ -307,6 +307,47 @@ test("PR lookup cache keeps no-PR results for 60 seconds and errors for 10 secon
   assert.equal(calls.filter((branch) => branch === "error").length, 2);
 });
 
+test("PR cache invalidation prevents an older in-flight lookup from restoring stale data", async () => {
+  let releaseOlder: (() => void) | undefined;
+  let markOlderStarted: (() => void) | undefined;
+  const olderStarted = new Promise<void>((resolve) => {
+    markOlderStarted = resolve;
+  });
+  let calls = 0;
+  const lookup = new CachedPullRequestLookup({
+    async findOpenPullRequest(_repository, branch) {
+      calls += 1;
+      if (calls === 1) {
+        markOlderStarted?.();
+        await new Promise<void>((resolve) => {
+          releaseOlder = resolve;
+        });
+        return {
+          number: 1,
+          state: "OPEN",
+          isDraft: false,
+          url: "https://example/old",
+        };
+      }
+      assert.equal(branch, "feature/cache");
+      return {
+        number: 2,
+        state: "OPEN",
+        isDraft: false,
+        url: "https://example/current",
+      };
+    },
+  });
+  const repository = { owner: "acme", repo: "widget" };
+  const older = lookup.findOpenPullRequest(repository, "feature/cache");
+  await olderStarted;
+  lookup.invalidate({ repository, branch: "feature/cache" });
+  releaseOlder?.();
+  assert.equal((await older)?.number, 1);
+  assert.equal((await lookup.findOpenPullRequest(repository, "feature/cache"))?.number, 2);
+  assert.equal(calls, 2);
+});
+
 test("PR lookup cache evicts old query identities at its configured bound", async () => {
   let calls = 0;
   const lookup = new CachedPullRequestLookup(

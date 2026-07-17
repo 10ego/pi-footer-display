@@ -376,7 +376,9 @@ export class FooterExtensionRuntime {
       .filter((effect) => effect.lifecycle === lifecycle)
       .sort((left, right) => left.sequence - right.sequence);
     if (dirty.length === 0) return;
-    const pendingHints = [...this.#pendingHints.values()];
+    const latestDirtySequence = Math.max(...dirty.map((effect) => effect.sequence));
+    const pendingHints = [...this.#pendingHints.values()]
+      .filter((entry) => entry.sequence > latestDirtySequence);
     this.#clearPendingHints();
     this.#removeStagedEffects(dirty);
     try {
@@ -633,7 +635,12 @@ export class FooterExtensionRuntime {
     let canPublish: boolean;
 
     if (mode === "pinned" && pinnedRoot) {
-      relevantEffects = await this.#effectsTouchRoot(effects, pinnedRoot);
+      const rootValidations = new Map<string, Promise<RepositoryDiscoveryOutcome>>();
+      relevantEffects = await this.#effectsTouchRoot(
+        effects,
+        pinnedRoot,
+        rootValidations,
+      );
       if (relevantEffects.length === 0) {
         this.#completeEffects(effects);
         return;
@@ -648,6 +655,7 @@ export class FooterExtensionRuntime {
       const dirtyRelevant = await this.#effectsTouchRoot(
         [...this.#dirtyEffects],
         pinnedRoot,
+        rootValidations,
       );
       const latestRelevant = Math.max(
         sequence,
@@ -759,22 +767,29 @@ export class FooterExtensionRuntime {
   async #effectsTouchRoot(
     effects: readonly StagedRepositoryEffect[],
     root: string,
+    validations: Map<string, Promise<RepositoryDiscoveryOutcome>>,
   ): Promise<StagedRepositoryEffect[]> {
     const matching = await Promise.all(effects.map(async (effect) => ({
       effect,
-      touches: await this.#effectTouchesRoot(effect, root),
+      touches: await this.#effectTouchesRoot(effect, root, validations),
     })));
     return matching
       .filter((entry) => entry.touches)
       .map((entry) => entry.effect);
   }
 
-  async #effectTouchesRoot(effect: RepositoryEffect, root: string): Promise<boolean> {
+  async #effectTouchesRoot(
+    effect: RepositoryEffect,
+    root: string,
+    validations: Map<string, Promise<RepositoryDiscoveryOutcome>>,
+  ): Promise<boolean> {
     const candidates = [effect.rootPath, effect.destinationPath]
       .filter((candidate): candidate is string => candidate !== undefined);
     if (candidates.some((candidate) => this.#pathWithin(root, candidate))) return true;
     for (const candidate of candidates) {
-      const outcome = await this.#validateRoot(candidate);
+      const validation = validations.get(candidate) ?? this.#validateRoot(candidate);
+      validations.set(candidate, validation);
+      const outcome = await validation;
       if (outcome.kind === "repository" && outcome.root === root) return true;
     }
     return false;

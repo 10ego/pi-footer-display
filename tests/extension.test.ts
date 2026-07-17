@@ -632,15 +632,17 @@ test("an unrelated failed effect preserves the confirmed automatic repository", 
   assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/a/u);
 });
 
-test("a pinned root refreshes through a symlinked git effect path", async (t) => {
+test("a pinned root refreshes through a symlinked git effect path once", async (t) => {
   const harness = createHarness();
   let branch = "main";
+  let symlinkLookups = 0;
   const repositories: RepositoryInspector = {
     async findRoot(candidate) {
       if (candidate === "/real/repo" || candidate.startsWith("/real/repo/")) {
         return discovery("/real/repo");
       }
       if (candidate === "/link/repo" || candidate.startsWith("/link/repo/")) {
+        symlinkLookups += 1;
         return discovery("/real/repo");
       }
       return discovery(null);
@@ -681,10 +683,12 @@ test("a pinned root refreshes through a symlinked git effect path", async (t) =>
   await runtime.start(ctx);
   await runtime.handleCommand("pin /real/repo", ctx);
   branch = "feature/symlink";
+  const beforeEffect = symlinkLookups;
   const call = bashCall("git -C /link/repo switch feature/symlink", "symlink-effect");
   runtime.observeToolCall(call, ctx);
   await runtime.observeToolResult(resultFor(call), ctx);
   assert.match(harness.statuses.at(-1)?.text ?? "", /^📌 acme\/repo · feature\/symlink/u);
+  assert.equal(symlinkLookups, beforeEffect + 1);
 });
 
 test("repository effects remain staged until their tool result", async (t) => {
@@ -899,6 +903,25 @@ test("agent_settled performs one conditional coalesced reconciliation", async ()
   await wait(15);
   assert.deepEqual({ discoveries, loads }, reconciledCounts);
   runtime.shutdown(ctx);
+});
+
+test("agent_settled drops a superseded pending hint before reconciling an effect", async (t) => {
+  const harness = createHarness();
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: dependencies,
+    debounceMs: 100,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+  t.after(() => runtime.shutdown(ctx));
+  await runtime.start(ctx);
+
+  runtime.observeToolCall(readCall("/repo/b/pending.ts"), ctx);
+  const effect = bashCall("git -C /repo/c switch feature/settled", "settled-later-effect");
+  runtime.observeToolCall(effect, ctx);
+  await runtime.observeAgentSettled(ctx);
+
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/c/u);
 });
 
 test("pinned mode ignores selection hints but refreshes relevant git mutations", async () => {
