@@ -18,7 +18,11 @@ import {
   type RepositoryDiscoveryOutcome,
   type RepositoryInspector,
 } from "../src/git.js";
-import { GhPullRequestLookup } from "../src/github.js";
+import {
+  CachedPullRequestLookup,
+  GhPullRequestLookup,
+  pullRequestQueryFingerprint,
+} from "../src/github.js";
 import { extractBashPaths, extractFileToolPaths } from "../src/paths.js";
 import { ExecFileRunner, ProcessExecutionError, type CommandRunner } from "../src/process.js";
 import { FooterSessionController } from "../src/state.js";
@@ -132,6 +136,110 @@ test("gh lookup always selects an explicit repository with safe argv", async () 
       "--limit", "1", "--json", "number,state,isDraft,url",
     ],
   });
+});
+
+test("PR query fingerprints normalize repository case without losing tuple boundaries", () => {
+  const fingerprint = pullRequestQueryFingerprint({
+    repository: { owner: "Acme", repo: "Widget" },
+    branch: "feature/Footer",
+  });
+  assert.equal(
+    fingerprint,
+    pullRequestQueryFingerprint({
+      repository: { owner: "acme", repo: "widget" },
+      branch: "feature/Footer",
+    }),
+  );
+  assert.notEqual(
+    fingerprint,
+    pullRequestQueryFingerprint({
+      repository: { owner: "acme", repo: "widget" },
+      branch: "feature/footer",
+    }),
+  );
+  assert.notEqual(
+    pullRequestQueryFingerprint({
+      repository: { owner: "acme-a", repo: "b" },
+      branch: "main",
+    }),
+    pullRequestQueryFingerprint({
+      repository: { owner: "acme", repo: "a-b" },
+      branch: "main",
+    }),
+  );
+  assert.throws(
+    () => pullRequestQueryFingerprint({
+      repository: { owner: "-invalid", repo: "widget" },
+      branch: "main",
+    }),
+    /invalid pull request query identity/u,
+  );
+});
+
+test("PR lookup cache keeps no-PR results for 60 seconds and errors for 10 seconds", async () => {
+  let now = 0;
+  const calls: string[] = [];
+  const lookup = new CachedPullRequestLookup(
+    {
+      async findOpenPullRequest(_repository, branch) {
+        calls.push(branch);
+        if (branch === "error") throw new Error("gh unavailable");
+        return undefined;
+      },
+    },
+    { now: () => now },
+  );
+  const repository = { owner: "acme", repo: "widget" };
+
+  assert.equal(await lookup.findOpenPullRequest(repository, "none"), undefined);
+  assert.equal(await lookup.findOpenPullRequest(repository, "none"), undefined);
+  now = 59_999;
+  assert.equal(await lookup.findOpenPullRequest(repository, "none"), undefined);
+  assert.equal(calls.filter((branch) => branch === "none").length, 1);
+  now = 60_000;
+  assert.equal(await lookup.findOpenPullRequest(repository, "none"), undefined);
+  assert.equal(calls.filter((branch) => branch === "none").length, 2);
+
+  await assert.rejects(
+    lookup.findOpenPullRequest(repository, "error"),
+    /gh unavailable/u,
+  );
+  await assert.rejects(
+    lookup.findOpenPullRequest(repository, "error"),
+    /gh unavailable/u,
+  );
+  now = 69_999;
+  await assert.rejects(
+    lookup.findOpenPullRequest(repository, "error"),
+    /gh unavailable/u,
+  );
+  assert.equal(calls.filter((branch) => branch === "error").length, 1);
+  now = 70_000;
+  await assert.rejects(
+    lookup.findOpenPullRequest(repository, "error"),
+    /gh unavailable/u,
+  );
+  assert.equal(calls.filter((branch) => branch === "error").length, 2);
+});
+
+test("PR lookup cache evicts old query identities at its configured bound", async () => {
+  let calls = 0;
+  const lookup = new CachedPullRequestLookup(
+    {
+      async findOpenPullRequest() {
+        calls += 1;
+        return undefined;
+      },
+    },
+    { maxEntries: 2 },
+  );
+  const repository = { owner: "acme", repo: "widget" };
+
+  await lookup.findOpenPullRequest(repository, "one");
+  await lookup.findOpenPullRequest(repository, "two");
+  await lookup.findOpenPullRequest(repository, "three");
+  await lookup.findOpenPullRequest(repository, "one");
+  assert.equal(calls, 4);
 });
 
 test("cache is bounded and negative entries expire sooner", () => {
@@ -538,6 +646,87 @@ test("metadata loader degrades safely for local-only, detached, and failed gh lo
     polarity: "negative",
   });
   assert.equal(ghCalls, 1);
+});
+
+test("local identity invalidation reuses only the matching PR query", async () => {
+  let identityReads = 0;
+  let identity: LocalRepositoryIdentity = {
+    root: "/repo",
+    name: "widget",
+    ref: { name: "main", detached: false },
+    github: { owner: "acme", repo: "widget" },
+  };
+  const ghCalls: string[] = [];
+  const repositories: RepositoryInspector = {
+    async findRoot() {
+      return discovery("/repo");
+    },
+    async validateRoot() {
+      return discovery("/repo");
+    },
+    async readIdentity() {
+      identityReads += 1;
+      return identity;
+    },
+  };
+  const loader = new DefaultRepositoryMetadataLoader(repositories, {
+    async findOpenPullRequest(repository, branch) {
+      ghCalls.push(`${repository.owner}/${repository.repo}:${branch}`);
+      if (repository.repo !== "widget") return undefined;
+      return {
+        number: branch === "main" ? 1 : 2,
+        state: "OPEN",
+        isDraft: false,
+        url: `https://example/${branch}`,
+      };
+    },
+  });
+  const core = new ContextCore({ repositories, metadata: loader });
+  const resolveMetadata = async (): Promise<RepositoryMetadata> => {
+    const outcome = await core.resolve([{ path: "/repo/file.ts", source: "file" }]);
+    assert.equal(outcome.kind, "resolved");
+    if (outcome.kind !== "resolved") throw new Error("expected resolved metadata");
+    return outcome.metadata;
+  };
+
+  assert.equal((await resolveMetadata()).pullRequest?.number, 1);
+  assert.equal((await resolveMetadata()).pullRequest?.number, 1);
+  assert.equal(identityReads, 1);
+  assert.equal(ghCalls.length, 1);
+
+  core.invalidateLocalIdentity("/repo");
+  assert.equal((await resolveMetadata()).pullRequest?.number, 1);
+  assert.equal(identityReads, 2);
+  assert.equal(ghCalls.length, 1);
+
+  identity = { ...identity, ref: { name: "feature/cache", detached: false } };
+  core.invalidateLocalIdentity("/repo");
+  assert.equal((await resolveMetadata()).pullRequest?.number, 2);
+  assert.equal(ghCalls.length, 2);
+
+  identity = {
+    ...identity,
+    name: "other",
+    github: { owner: "acme", repo: "other" },
+  };
+  core.invalidateLocalIdentity("/repo");
+  assert.equal((await resolveMetadata()).pullRequest, undefined);
+  assert.equal(ghCalls.length, 3);
+
+  identity = {
+    ...identity,
+    name: "widget",
+    github: { owner: "acme", repo: "widget" },
+  };
+  core.invalidateLocalIdentity("/repo");
+  assert.equal((await resolveMetadata()).pullRequest?.number, 2);
+  assert.equal(ghCalls.length, 3);
+
+  identity = { ...identity, ref: { name: "main", detached: false } };
+  core.invalidateRepository("/repo");
+  assert.equal((await resolveMetadata()).pullRequest?.number, 1);
+  assert.equal(identityReads, 6);
+  assert.equal(ghCalls.length, 4);
 });
 
 test("gh lookup distinguishes no PR from command and response failures", async () => {

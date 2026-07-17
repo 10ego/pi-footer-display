@@ -1,5 +1,10 @@
 import { BoundedTtlCache, type CachePolarity } from "./cache.js";
-import type { PullRequestLookup } from "./github.js";
+import {
+  CachedPullRequestLookup,
+  isValidPullRequestQuery,
+  type CachedPullRequestLookupOptions,
+  type PullRequestLookup,
+} from "./github.js";
 import type {
   RepositoryDiscoveryOutcome,
   RepositoryInspector,
@@ -7,6 +12,7 @@ import type {
 import type {
   DiscoverySource,
   PathHint,
+  PullRequestQuery,
   RepositoryMetadata,
   ResolutionOutcome,
 } from "./types.js";
@@ -18,15 +24,29 @@ export interface MetadataLoadResult {
 
 export interface RepositoryMetadataLoader {
   load(root: string): Promise<MetadataLoadResult>;
+  /** Invalidates network-derived data for an explicit repository refresh. */
+  invalidate?(root: string): void;
+  clear?(): void;
+}
+
+export interface DefaultRepositoryMetadataLoaderOptions {
+  readonly pullRequestCache?: CachedPullRequestLookupOptions;
 }
 
 export class DefaultRepositoryMetadataLoader implements RepositoryMetadataLoader {
   readonly #repositories: RepositoryInspector;
-  readonly #pullRequests: PullRequestLookup;
+  readonly #pullRequests: CachedPullRequestLookup;
 
-  constructor(repositories: RepositoryInspector, pullRequests: PullRequestLookup) {
+  constructor(
+    repositories: RepositoryInspector,
+    pullRequests: PullRequestLookup,
+    options: DefaultRepositoryMetadataLoaderOptions = {},
+  ) {
     this.#repositories = repositories;
-    this.#pullRequests = pullRequests;
+    this.#pullRequests = new CachedPullRequestLookup(
+      pullRequests,
+      options.pullRequestCache,
+    );
   }
 
   async load(root: string): Promise<MetadataLoadResult> {
@@ -44,10 +64,21 @@ export class DefaultRepositoryMetadataLoader implements RepositoryMetadataLoader
       };
     }
 
+    const query = {
+      repository: { ...identity.github },
+      branch: identity.ref.name,
+    } satisfies PullRequestQuery;
+    if (!isValidPullRequestQuery(query)) {
+      return {
+        metadata: { ...identity, degraded: ["github-unavailable"] },
+        polarity: "negative",
+      };
+    }
+
     try {
       const pullRequest = await this.#pullRequests.findOpenPullRequest(
-        identity.github,
-        identity.ref.name,
+        query.repository,
+        query.branch,
       );
       return {
         metadata: {
@@ -64,6 +95,16 @@ export class DefaultRepositoryMetadataLoader implements RepositoryMetadataLoader
         polarity: "negative",
       };
     }
+  }
+
+  invalidate(_root: string): void {
+    // Identity is read after invalidation, so clear every bounded query entry to
+    // guarantee explicit refresh even when the branch changed while cached.
+    this.#pullRequests.clear();
+  }
+
+  clear(): void {
+    this.#pullRequests.clear();
   }
 }
 
@@ -146,13 +187,21 @@ export class ContextCore {
     this.#pathCache.delete(path);
   }
 
-  invalidateRepository(root: string): void {
+  /** Evicts the volatile local snapshot while retaining reusable PR query data. */
+  invalidateLocalIdentity(root: string): void {
     this.#metadataCache.delete(root);
+  }
+
+  /** Explicit refresh invalidates both local identity and its last PR query. */
+  invalidateRepository(root: string): void {
+    this.invalidateLocalIdentity(root);
+    this.#metadata.invalidate?.(root);
   }
 
   clear(): void {
     this.#pathCache.clear();
     this.#metadataCache.clear();
+    this.#metadata.clear?.();
   }
 
   async #root(candidate: string): Promise<RepositoryDiscoveryOutcome> {

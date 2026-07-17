@@ -15,6 +15,11 @@ export interface GitReference {
   readonly detached: boolean;
 }
 
+export interface PullRequestQuery {
+  readonly repository: GitHubRepository;
+  readonly branch: string;
+}
+
 export interface LocalRepositoryIdentity {
   readonly root: string;
   readonly name: string;
