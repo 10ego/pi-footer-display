@@ -4,6 +4,7 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
   ToolCallEvent,
+  ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 import { ContextCore, DefaultRepositoryMetadataLoader } from "./context.js";
 import { formatFooter } from "./format.js";
@@ -13,7 +14,11 @@ import {
   type RepositoryInspector,
 } from "./git.js";
 import { GhPullRequestLookup } from "./github.js";
-import { extractBashPaths, extractFileToolPaths, fallbackPath } from "./paths.js";
+import {
+  fallbackPath,
+  inferToolCall,
+  type RepositoryEffect,
+} from "./paths.js";
 import { ExecFileRunner } from "./process.js";
 import { FooterSessionController } from "./state.js";
 import type { PathHint, ResolutionOutcome, SessionMode } from "./types.js";
@@ -59,10 +64,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function recordValue(value: unknown, key: string): unknown {
-  return isRecord(value) ? value[key] : undefined;
-}
-
 function validTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
@@ -102,6 +103,17 @@ export function parsePersistedFooterState(
 interface RestoredFooterState {
   readonly state: PersistedFooterState;
   readonly fromEntry: boolean;
+}
+
+interface SequencedHint {
+  readonly hint: PathHint;
+  readonly sequence: number;
+}
+
+interface StagedRepositoryEffect extends RepositoryEffect {
+  readonly toolCallId: string;
+  readonly sequence: number;
+  readonly lifecycle: number;
 }
 
 function persistedStateFromContext(
@@ -161,10 +173,18 @@ export class FooterExtensionRuntime {
   #lastPersisted: PersistedFooterState | undefined;
   #ageTimer: ReturnType<typeof setInterval> | undefined;
   #debounceTimer: ReturnType<typeof setTimeout> | undefined;
-  #pendingHints = new Map<string, PathHint>();
+  #pendingHints = new Map<string, SequencedHint>();
+  #stagedEffects = new Map<string, StagedRepositoryEffect[]>();
+  #dirtyEffects = new Set<StagedRepositoryEffect>();
+  #activeReconciliations = new Set<Promise<void>>();
+  #transitionWaiters = new Set<() => void>();
   #lifecycle = 0;
   #disposed = true;
   #transitionCount = 0;
+  #nextSequence = 0;
+  #latestSelectionSequence = 0;
+  #dirtyEpoch = 0;
+  #settledEpoch = 0;
 
   constructor(pi: ExtensionAPI, options: FooterExtensionOptions = {}) {
     this.#pi = pi;
@@ -184,6 +204,12 @@ export class FooterExtensionRuntime {
     });
     this.#pi.on("tool_call", (event, ctx) => {
       this.observeToolCall(event, ctx);
+    });
+    this.#pi.on("tool_result", async (event, ctx) => {
+      await this.observeToolResult(event, ctx);
+    });
+    this.#pi.on("agent_settled", async (_event, ctx) => {
+      await this.observeAgentSettled(ctx);
     });
     this.#pi.registerCommand("pr-footer", {
       description: "Show or control repository footer context",
@@ -282,30 +308,82 @@ export class FooterExtensionRuntime {
   }
 
   observeToolCall(event: ToolCallEvent, ctx: ExtensionContext): void {
-    if (
-      this.#disposed ||
-      this.#transitionCount > 0 ||
-      this.#controller?.state.mode !== "auto"
-    ) {
+    if (this.#disposed) return;
+    const inference = inferToolCall(event.toolName, event.input, ctx.cwd);
+    const acceptsHints =
+      this.#transitionCount === 0 && this.#controller?.state.mode === "auto";
+    if (inference.effects.length === 0 && (!acceptsHints || inference.hints.length === 0)) {
       return;
     }
 
-    const hints = extractFileToolPaths(event.toolName, event.input, ctx.cwd);
-    const command = recordValue(event.input, "command");
-    if (event.toolName === "bash" && typeof command === "string") {
-      hints.push(...extractBashPaths(command));
+    const sequence = this.#takeSequence();
+    if (acceptsHints && inference.hints.length > 0) {
+      this.#latestSelectionSequence = sequence;
     }
-    if (hints.length === 0) return;
+    if (inference.effects.length > 0) {
+      const staged = inference.effects.map((effect) => ({
+        ...effect,
+        toolCallId: event.toolCallId,
+        sequence,
+        lifecycle: this.#lifecycle,
+      }));
+      const existing = this.#stagedEffects.get(event.toolCallId) ?? [];
+      this.#stagedEffects.set(event.toolCallId, [...existing, ...staged]);
+      for (const effect of staged) this.#dirtyEffects.add(effect);
+      this.#dirtyEpoch += 1;
+      // Mutation hints are evidence only after Pi reports that execution ended.
+      return;
+    }
 
-    for (const hint of hints) {
-      this.#pendingHints.set(`${hint.source}\0${hint.path}`, hint);
+    if (!acceptsHints || inference.hints.length === 0) return;
+    for (const hint of inference.hints) {
+      this.#pendingHints.set(`${hint.source}\0${hint.path}`, { hint, sequence });
     }
-    if (this.#debounceTimer) clearTimeout(this.#debounceTimer);
+    this.#scheduleObservedHints();
+  }
+
+  async observeToolResult(
+    event: ToolResultEvent,
+    _ctx?: ExtensionContext,
+  ): Promise<void> {
+    if (this.#disposed) return;
+    const staged = this.#stagedEffects.get(event.toolCallId);
+    if (!staged || staged.length === 0) return;
+    this.#stagedEffects.delete(event.toolCallId);
+    const effects = staged.filter((effect) => effect.lifecycle === this.#lifecycle);
+    this.#completeEffects(staged.filter((effect) => effect.lifecycle !== this.#lifecycle));
+    if (effects.length === 0) return;
+
     const lifecycle = this.#lifecycle;
-    this.#debounceTimer = setTimeout(() => {
-      this.#debounceTimer = undefined;
-      void this.#flushObservedHints(lifecycle);
-    }, this.#debounceMs);
+    const sequence = Math.max(...effects.map((effect) => effect.sequence));
+    this.#removePendingHintsThrough(sequence);
+    await this.#trackReconciliation(
+      this.#reconcileAfterTransitions(effects, lifecycle, false),
+    );
+  }
+
+  async observeAgentSettled(_ctx?: ExtensionContext): Promise<void> {
+    if (this.#disposed) return;
+    const lifecycle = this.#lifecycle;
+    const active = [...this.#activeReconciliations];
+    if (active.length > 0) await Promise.allSettled(active);
+    await this.#waitForTransitions(lifecycle);
+    if (!this.#active(lifecycle) || this.#dirtyEffects.size === 0) return;
+    if (this.#settledEpoch === this.#dirtyEpoch) return;
+    this.#settledEpoch = this.#dirtyEpoch;
+
+    const dirty = [...this.#dirtyEffects]
+      .filter((effect) => effect.lifecycle === lifecycle)
+      .sort((left, right) => left.sequence - right.sequence);
+    if (dirty.length === 0) return;
+    const pendingHints = [...this.#pendingHints.values()];
+    this.#clearPendingHints();
+    this.#removeStagedEffects(dirty);
+    try {
+      await this.#reconcileEffects(dirty, lifecycle, true, pendingHints);
+    } finally {
+      this.#completeEffects(dirty);
+    }
   }
 
   async handleCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -352,6 +430,7 @@ export class FooterExtensionRuntime {
     const lifecycle = this.#lifecycle;
     const controller = this.#controller;
     if (!controller) return;
+    this.#advanceSequenceBarrier();
     const guardGeneration = controller.beginRefresh();
     this.#transitionCount += 1;
     this.#clearPendingHints();
@@ -388,6 +467,7 @@ export class FooterExtensionRuntime {
     } finally {
       if (this.#active(lifecycle)) {
         this.#transitionCount = Math.max(0, this.#transitionCount - 1);
+        if (this.#transitionCount === 0) this.#releaseTransitionWaiters();
       }
     }
   }
@@ -401,6 +481,7 @@ export class FooterExtensionRuntime {
       return;
     }
 
+    this.#advanceSequenceBarrier();
     controller.unpin();
     this.#persistIfChanged();
     ctx.ui.notify("Repository selection is automatic", "info");
@@ -416,6 +497,7 @@ export class FooterExtensionRuntime {
 
   async #refresh(ctx: ExtensionCommandContext): Promise<void> {
     if (!this.#ready(ctx)) return;
+    this.#advanceSequenceBarrier();
     const controller = this.#controller;
     const root =
       controller?.state.pinnedRoot ??
@@ -443,15 +525,23 @@ export class FooterExtensionRuntime {
       this.#pendingHints.clear();
       return;
     }
-    const hints = [...this.#pendingHints.values()];
+    const observed = [...this.#pendingHints.values()];
     this.#pendingHints.clear();
-    if (hints.length === 0) return;
+    if (observed.length === 0) return;
+    const sequence = Math.max(...observed.map((entry) => entry.sequence));
+    const hints = observed.map((entry) => entry.hint);
 
     const controller = this.#controller;
     if (!controller) return;
     const generation = controller.beginRefresh();
     const outcome = await this.#safeResolve(hints);
-    if (!this.#active(lifecycle) || controller.state.mode !== "auto") return;
+    if (
+      !this.#active(lifecycle) ||
+      controller.state.mode !== "auto" ||
+      sequence !== this.#latestSelectionSequence
+    ) {
+      return;
+    }
     // Confirmed unrelated non-repository activity is not evidence to discard a root.
     if (outcome.kind === "no-repository" && this.#lastConfirmedRoot) return;
     this.#commitOutcome(outcome, lifecycle, generation);
@@ -497,6 +587,169 @@ export class FooterExtensionRuntime {
         : { kind: "unavailable", reason: "footer is not initialized" };
     } catch (error) {
       return unavailable(error);
+    }
+  }
+
+  async #safeReconcile(
+    hints: readonly PathHint[],
+    pullRequestPaths: readonly string[],
+    sequence: number,
+  ): Promise<ResolutionOutcome> {
+    try {
+      return this.#dependencies
+        ? await this.#dependencies.core.reconcile(hints, {
+            pullRequestPaths,
+            sequence,
+          })
+        : { kind: "unavailable", reason: "footer is not initialized" };
+    } catch (error) {
+      return unavailable(error);
+    }
+  }
+
+  async #reconcileEffects(
+    effects: readonly StagedRepositoryEffect[],
+    lifecycle: number,
+    finalBarrier: boolean,
+    additionalHints: readonly SequencedHint[] = [],
+  ): Promise<void> {
+    const controller = this.#controller;
+    if (
+      !controller ||
+      !this.#active(lifecycle) ||
+      effects.length === 0
+    ) {
+      return;
+    }
+
+    const mode = controller.state.mode;
+    const pinnedRoot = controller.state.pinnedRoot;
+    let relevantEffects = [...effects];
+    let hints: PathHint[];
+    let pullRequestPaths: string[];
+    let sequence = Math.max(...effects.map((effect) => effect.sequence));
+    let canPublish: boolean;
+
+    if (mode === "pinned" && pinnedRoot) {
+      relevantEffects = effects.filter((effect) => this.#effectTouchesRoot(effect, pinnedRoot));
+      if (relevantEffects.length === 0) {
+        this.#completeEffects(effects);
+        return;
+      }
+      sequence = Math.max(...relevantEffects.map((effect) => effect.sequence));
+      hints = [{ path: pinnedRoot, source: "file" }];
+      pullRequestPaths = relevantEffects.some(
+        (effect) => effect.kind === "github-pr-mutation",
+      )
+        ? [pinnedRoot]
+        : [];
+      const latestRelevant = Math.max(
+        ...[...this.#dirtyEffects]
+          .filter((effect) => this.#effectTouchesRoot(effect, pinnedRoot))
+          .map((effect) => effect.sequence),
+      );
+      canPublish = sequence >= latestRelevant;
+    } else {
+      const effectHints = effects.flatMap((effect): PathHint[] => [
+        ...(effect.destinationPath
+          ? [{ path: effect.destinationPath, source: "file" as const }]
+          : []),
+        { path: effect.rootPath, source: "bash" },
+      ]);
+      hints = [...additionalHints.map((entry) => entry.hint), ...effectHints];
+      pullRequestPaths = effects
+        .filter((effect) => effect.kind === "github-pr-mutation")
+        .map((effect) => effect.rootPath);
+      if (additionalHints.length > 0) {
+        sequence = Math.max(
+          sequence,
+          ...additionalHints.map((entry) => entry.sequence),
+        );
+      }
+      canPublish = mode === "auto" && sequence >= this.#latestSelectionSequence;
+    }
+
+    const generation = canPublish ? controller.beginRefresh() : undefined;
+    const outcome = await this.#safeReconcile(hints, pullRequestPaths, sequence);
+    if (!this.#active(lifecycle)) return;
+    if (finalBarrier || outcome.kind !== "unavailable") {
+      this.#completeEffects(effects);
+    }
+    if (!canPublish || generation === undefined) return;
+    if (mode === "pinned") {
+      if (
+        controller.state.mode !== "pinned" ||
+        controller.state.pinnedRoot !== pinnedRoot
+      ) {
+        return;
+      }
+    } else if (
+      controller.state.mode !== "auto" ||
+      sequence < this.#latestSelectionSequence
+    ) {
+      return;
+    }
+    this.#commitOutcome(outcome, lifecycle, generation);
+  }
+
+  async #trackReconciliation(work: Promise<void>): Promise<void> {
+    this.#activeReconciliations.add(work);
+    try {
+      await work;
+    } finally {
+      this.#activeReconciliations.delete(work);
+    }
+  }
+
+  async #reconcileAfterTransitions(
+    effects: readonly StagedRepositoryEffect[],
+    lifecycle: number,
+    finalBarrier: boolean,
+  ): Promise<void> {
+    await this.#waitForTransitions(lifecycle);
+    if (!this.#active(lifecycle)) return;
+    await this.#reconcileEffects(effects, lifecycle, finalBarrier);
+  }
+
+  async #waitForTransitions(lifecycle: number): Promise<void> {
+    while (this.#active(lifecycle) && this.#transitionCount > 0) {
+      await new Promise<void>((resolve) => {
+        this.#transitionWaiters.add(resolve);
+      });
+    }
+  }
+
+  #releaseTransitionWaiters(): void {
+    const waiters = [...this.#transitionWaiters];
+    this.#transitionWaiters.clear();
+    for (const resolve of waiters) resolve();
+  }
+
+  #effectTouchesRoot(effect: RepositoryEffect, root: string): boolean {
+    return (
+      this.#pathWithin(root, effect.rootPath) ||
+      (effect.destinationPath !== undefined && this.#pathWithin(root, effect.destinationPath))
+    );
+  }
+
+  #pathWithin(root: string, candidate: string): boolean {
+    const relative = path.relative(root, candidate);
+    return (
+      relative === "" ||
+      (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+    );
+  }
+
+  #completeEffects(effects: readonly StagedRepositoryEffect[]): void {
+    for (const effect of effects) this.#dirtyEffects.delete(effect);
+  }
+
+  #removeStagedEffects(effects: readonly StagedRepositoryEffect[]): void {
+    const removing = new Set(effects);
+    for (const [toolCallId, staged] of this.#stagedEffects) {
+      const retained = staged.filter((effect) => !removing.has(effect));
+      if (retained.length > 0) this.#stagedEffects.set(toolCallId, retained);
+      else this.#stagedEffects.delete(toolCallId);
     }
   }
 
@@ -601,6 +854,37 @@ export class FooterExtensionRuntime {
     return !this.#disposed && lifecycle === this.#lifecycle;
   }
 
+  #scheduleObservedHints(): void {
+    if (this.#debounceTimer) clearTimeout(this.#debounceTimer);
+    const lifecycle = this.#lifecycle;
+    this.#debounceTimer = setTimeout(() => {
+      this.#debounceTimer = undefined;
+      void this.#flushObservedHints(lifecycle);
+    }, this.#debounceMs);
+  }
+
+  #removePendingHintsThrough(sequence: number): void {
+    for (const [key, entry] of this.#pendingHints) {
+      if (entry.sequence <= sequence) this.#pendingHints.delete(key);
+    }
+    if (this.#pendingHints.size === 0 && this.#debounceTimer) {
+      clearTimeout(this.#debounceTimer);
+      this.#debounceTimer = undefined;
+    }
+  }
+
+  #takeSequence(): number {
+    this.#nextSequence += 1;
+    return this.#nextSequence;
+  }
+
+  #advanceSequenceBarrier(): number {
+    const sequence = this.#takeSequence();
+    this.#latestSelectionSequence = sequence;
+    this.#clearPendingHints();
+    return sequence;
+  }
+
   #clearPendingHints(): void {
     if (this.#debounceTimer) clearTimeout(this.#debounceTimer);
     this.#debounceTimer = undefined;
@@ -611,9 +895,17 @@ export class FooterExtensionRuntime {
     this.#lifecycle += 1;
     this.#disposed = true;
     this.#transitionCount = 0;
+    this.#nextSequence = 0;
+    this.#latestSelectionSequence = 0;
+    this.#dirtyEpoch = 0;
+    this.#settledEpoch = 0;
     if (this.#ageTimer) clearInterval(this.#ageTimer);
     this.#ageTimer = undefined;
     this.#clearPendingHints();
+    this.#stagedEffects.clear();
+    this.#dirtyEffects.clear();
+    this.#activeReconciliations.clear();
+    this.#releaseTransitionWaiters();
     this.#controller?.cleanup();
     this.#dependencies?.core.clear();
     try {

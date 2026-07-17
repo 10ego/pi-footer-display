@@ -23,7 +23,12 @@ import {
   GhPullRequestLookup,
   pullRequestQueryFingerprint,
 } from "../src/github.js";
-import { extractBashPaths, extractFileToolPaths } from "../src/paths.js";
+import {
+  extractBashPaths,
+  extractFileToolPaths,
+  inferBashCommand,
+  inferToolCall,
+} from "../src/paths.js";
 import { ExecFileRunner, ProcessExecutionError, type CommandRunner } from "../src/process.js";
 import { FooterSessionController } from "../src/state.js";
 import type {
@@ -73,6 +78,86 @@ test("extracts strong file paths and only narrow bash forms", () => {
   assert.deepEqual(extractBashPaths("cd relative && npm test"), []);
   assert.deepEqual(extractBashPaths("cd /work/repo && npm test && pwd"), []);
   assert.deepEqual(extractBashPaths("cat /work/a\npwd"), []);
+});
+
+test("infers relative literal cwd, git -C, worktree, and gh effects", () => {
+  assert.deepEqual(
+    inferBashCommand("cd ../b && git status", "/work/a"),
+    {
+      hints: [{ path: "/work/b", source: "bash" }],
+      effects: [],
+    },
+  );
+  assert.deepEqual(
+    inferBashCommand("git -C ../b switch feature/footer", "/work/a"),
+    {
+      hints: [{ path: "/work/b", source: "bash" }],
+      effects: [{ kind: "git-mutation", rootPath: "/work/b" }],
+    },
+  );
+  assert.deepEqual(
+    inferBashCommand("git worktree add ../b feature/footer", "/work/a"),
+    {
+      hints: [
+        { path: "/work/b", source: "file" },
+        { path: "/work/a", source: "bash" },
+      ],
+      effects: [{
+        kind: "worktree-add",
+        rootPath: "/work/a",
+        destinationPath: "/work/b",
+      }],
+    },
+  );
+  assert.deepEqual(
+    inferBashCommand("gh pr create --title 'Footer refresh'", "/work/a"),
+    {
+      hints: [{ path: "/work/a", source: "bash" }],
+      effects: [{ kind: "github-pr-mutation", rootPath: "/work/a" }],
+    },
+  );
+  assert.deepEqual(
+    inferToolCall("custom.read", { path: "/work/b" }, "/work/a"),
+    { hints: [], effects: [] },
+  );
+});
+
+test("effect inference rejects unsafe syntax, cwd conflicts, and unsupported options", () => {
+  for (const command of [
+    "cd $TARGET && git status",
+    "cd $(pwd) && git status",
+    "cd ../* && git status",
+    "cd ~/repo && git status",
+    "cd ../b && git status > /tmp/out",
+    "cd ../b && git status | cat",
+    "cd ../b && (git status)",
+    "cd ../b; git status",
+    "cd ../b && cd ../c",
+    "cd ../b && git -C . switch feature",
+    "git -C ../b -C ../c switch feature",
+    "git worktree add -b feature ../b",
+    "git config --get remote.origin.url",
+    "gh pr create --repo acme/widget",
+    "gh pr create -Racme/widget",
+    "cd ../b && gh pr create --repo acme/widget",
+    "cd ../b && npm\0 test",
+  ]) {
+    assert.deepEqual(inferBashCommand(command, "/work/a"), {
+      hints: [],
+      effects: [],
+    }, command);
+  }
+  assert.deepEqual(inferBashCommand("gh pr list", "/work/a"), {
+    hints: [],
+    effects: [],
+  });
+  assert.deepEqual(
+    inferBashCommand("git config remote.origin.url git@github.com:acme/widget.git", "/work/a"),
+    {
+      hints: [{ path: "/work/a", source: "bash" }],
+      effects: [{ kind: "git-mutation", rootPath: "/work/a" }],
+    },
+  );
 });
 
 test("parses common GitHub remote forms", () => {
@@ -842,6 +927,118 @@ test("context converts metadata failures to unavailable outcomes", async () => {
     reason: "git disappeared",
     root: "/repo",
   });
+});
+
+test("late discovery cannot repopulate a path cache after reconciliation", async () => {
+  let discoveryCalls = 0;
+  let releaseOlder: (() => void) | undefined;
+  let markOlderStarted: (() => void) | undefined;
+  const olderStarted = new Promise<void>((resolve) => {
+    markOlderStarted = resolve;
+  });
+  const repositories: RepositoryInspector = {
+    async findRoot() {
+      discoveryCalls += 1;
+      if (discoveryCalls === 1) {
+        markOlderStarted?.();
+        await new Promise<void>((resolve) => {
+          releaseOlder = resolve;
+        });
+        return discovery("/repo/old");
+      }
+      return discovery("/repo/new");
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      return metadataForRoot(root);
+    },
+  };
+  const metadataForRoot = (root: string): RepositoryMetadata => ({
+    ...metadata,
+    root,
+    name: root.endsWith("old") ? "old" : "new",
+    github: { owner: "acme", repo: root.endsWith("old") ? "old" : "new" },
+  });
+  const core = new ContextCore({
+    repositories,
+    metadata: {
+      async load(root) {
+        return { metadata: metadataForRoot(root), polarity: "positive" };
+      },
+    },
+  });
+  const hints = [{ path: "/work/target", source: "file" as const }];
+
+  const older = core.resolve(hints);
+  await olderStarted;
+  const reconciled = await core.reconcile(hints, { sequence: 2 });
+  assert.equal(reconciled.kind, "resolved");
+  if (reconciled.kind === "resolved") assert.equal(reconciled.metadata.root, "/repo/new");
+
+  releaseOlder?.();
+  await older;
+  const current = await core.resolve(hints);
+  assert.equal(current.kind, "resolved");
+  if (current.kind === "resolved") assert.equal(current.metadata.root, "/repo/new");
+  assert.equal(discoveryCalls, 2);
+});
+
+test("late metadata cannot repopulate an invalidated repository snapshot", async () => {
+  let loads = 0;
+  let releaseOlder: (() => void) | undefined;
+  let markOlderStarted: (() => void) | undefined;
+  const olderStarted = new Promise<void>((resolve) => {
+    markOlderStarted = resolve;
+  });
+  const repositories: RepositoryInspector = {
+    async findRoot() {
+      return discovery("/repo");
+    },
+    async validateRoot() {
+      return discovery("/repo");
+    },
+    async readIdentity(root) {
+      return metadataForBranch(root, "main");
+    },
+  };
+  const metadataForBranch = (root: string, branch: string): RepositoryMetadata => ({
+    ...metadata,
+    root,
+    ref: { name: branch, detached: false },
+  });
+  const core = new ContextCore({
+    repositories,
+    metadata: {
+      async load(root) {
+        loads += 1;
+        if (loads === 1) {
+          markOlderStarted?.();
+          await new Promise<void>((resolve) => {
+            releaseOlder = resolve;
+          });
+          return { metadata: metadataForBranch(root, "old"), polarity: "positive" };
+        }
+        return { metadata: metadataForBranch(root, "new"), polarity: "positive" };
+      },
+    },
+  });
+  const hints = [{ path: "/repo", source: "file" as const }];
+
+  const older = core.resolve(hints);
+  await olderStarted;
+  core.invalidateLocalIdentity("/repo");
+  const current = await core.resolve(hints);
+  assert.equal(current.kind, "resolved");
+  if (current.kind === "resolved") assert.equal(current.metadata.ref.name, "new");
+
+  releaseOlder?.();
+  await older;
+  const cached = await core.resolve(hints);
+  assert.equal(cached.kind, "resolved");
+  if (cached.kind === "resolved") assert.equal(cached.metadata.ref.name, "new");
+  assert.equal(loads, 2);
 });
 
 test("git discovery walks to an existing ancestor for nested write targets", async () => {

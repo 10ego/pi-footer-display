@@ -5,8 +5,13 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
   ToolCallEvent,
+  ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
-import { ContextCore, type RepositoryMetadataLoader } from "../src/context.js";
+import {
+  ContextCore,
+  DefaultRepositoryMetadataLoader,
+  type RepositoryMetadataLoader,
+} from "../src/context.js";
 import {
   FOOTER_STATE_ENTRY,
   FOOTER_STATUS_KEY,
@@ -142,13 +147,25 @@ function pathToolCall(toolName: "grep" | "find" | "ls", path: string): ToolCallE
   } as ToolCallEvent;
 }
 
-function bashCall(command: string): ToolCallEvent {
+function bashCall(command: string, toolCallId = command): ToolCallEvent {
   return {
     type: "tool_call",
-    toolCallId: command,
+    toolCallId,
     toolName: "bash",
     input: { command },
   };
+}
+
+function resultFor(call: ToolCallEvent, isError = false): ToolResultEvent {
+  return {
+    type: "tool_result",
+    toolCallId: call.toolCallId,
+    toolName: call.toolName,
+    input: call.input,
+    content: [],
+    details: undefined,
+    isError,
+  } as ToolResultEvent;
 }
 
 function wait(ms: number): Promise<void> {
@@ -429,6 +446,487 @@ test("grep, find, and ls paths are strong extension evidence over bash hints", a
   }
 
   runtime.shutdown(ctx);
+});
+
+test("git and gh effects reconcile only after tool_result without retaining an old PR", async () => {
+  const harness = createHarness();
+  let branch = "main";
+  let featurePullRequest: RepositoryMetadata["pullRequest"];
+  let identityReads = 0;
+  let ghCalls = 0;
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      return discovery(
+        candidate === "/repo/a" || candidate.startsWith("/repo/a/")
+          ? "/repo/a"
+          : null,
+      );
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      identityReads += 1;
+      return {
+        root,
+        name: "widget",
+        ref: { name: branch, detached: false },
+        github: { owner: "acme", repo: "widget" },
+      };
+    },
+  };
+  const loader = new DefaultRepositoryMetadataLoader(repositories, {
+    async findOpenPullRequest(_repository, head) {
+      ghCalls += 1;
+      if (head === "main") {
+        return {
+          number: 1,
+          state: "OPEN",
+          isDraft: false,
+          url: "https://example/1",
+        };
+      }
+      return featurePullRequest;
+    },
+  });
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({ repositories, metadata: loader }),
+    }),
+    debounceMs: 5,
+    ageIntervalMs: 5,
+  });
+  const ctx = context(harness, { cwd: "/repo/a" });
+  await runtime.start(ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /main · PR #1/u);
+
+  const branchCall = bashCall("git -C . switch feature/footer", "branch-change");
+  runtime.observeToolCall(branchCall, ctx);
+  await wait(15);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /main · PR #1/u);
+  assert.equal(identityReads, 1);
+
+  branch = "feature/footer";
+  await runtime.observeToolResult(resultFor(branchCall), ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /feature\/footer/u);
+  assert.doesNotMatch(harness.statuses.at(-1)?.text ?? "", /PR #1/u);
+  assert.equal(identityReads, 2);
+  assert.equal(ghCalls, 2);
+
+  const sameBranchCall = bashCall("git checkout feature/footer", "same-branch");
+  runtime.observeToolCall(sameBranchCall, ctx);
+  await runtime.observeToolResult(resultFor(sameBranchCall), ctx);
+  assert.equal(identityReads, 3);
+  assert.equal(ghCalls, 2, "same PR query should stay cached after a local mutation");
+
+  featurePullRequest = {
+    number: 9,
+    state: "OPEN",
+    isDraft: false,
+    url: "https://example/9",
+  };
+  const ghCall = bashCall("gh pr create --title 'Footer refresh'", "create-pr");
+  runtime.observeToolCall(ghCall, ctx);
+  await runtime.observeToolResult(resultFor(ghCall, true), ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /PR #9/u);
+  assert.equal(ghCalls, 3, "an errored gh result still invalidates its relevant query");
+
+  const callsBeforeUnsupported = { identityReads, ghCalls };
+  const unsupported = bashCall("gh pr create --repo acme/other", "unsupported-gh");
+  runtime.observeToolCall(unsupported, ctx);
+  await runtime.observeToolResult(resultFor(unsupported), ctx);
+  await runtime.observeAgentSettled(ctx);
+  await wait(15);
+  assert.deepEqual({ identityReads, ghCalls }, callsBeforeUnsupported);
+  runtime.shutdown(ctx);
+});
+
+test("repository effects remain staged until their tool result", async (t) => {
+  const harness = createHarness();
+  const loadCounts = new Map<string, number>();
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => dependencies(loadCounts),
+    debounceMs: 5,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+  t.after(() => runtime.shutdown(ctx));
+  await runtime.start(ctx);
+  const countsAfterStart = new Map(loadCounts);
+
+  const call = bashCall("git -C /repo/b switch feature/staged", "staged-effect");
+  runtime.observeToolCall(call, ctx);
+  await wait(15);
+  assert.deepEqual(loadCounts, countsAfterStart);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/a/u);
+
+  await runtime.observeToolResult(resultFor(call, true), ctx);
+  assert.equal(loadCounts.get("/repo/b"), 1);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/b/u);
+});
+
+test("tool-call order wins when mutation results complete out of order", async (t) => {
+  const harness = createHarness();
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: dependencies,
+    debounceMs: 100,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+  t.after(() => runtime.shutdown(ctx));
+  await runtime.start(ctx);
+
+  const calledFirst = bashCall("git -C /repo/b switch first", "called-first");
+  const calledSecond = bashCall("git -C /repo/c switch second", "called-second");
+  runtime.observeToolCall(calledFirst, ctx);
+  runtime.observeToolCall(calledSecond, ctx);
+
+  await runtime.observeToolResult(resultFor(calledSecond), ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/c/u);
+  await runtime.observeToolResult(resultFor(calledFirst), ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/c/u);
+});
+
+test("a tool result from before refresh cannot overwrite refreshed context", async (t) => {
+  const harness = createHarness();
+  let branch = "main";
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      return discovery(
+        candidate === "/repo/a" || candidate.startsWith("/repo/a/")
+          ? "/repo/a"
+          : null,
+      );
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      return { ...metadata(root), ref: { name: branch, detached: false } };
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            return {
+              metadata: { ...metadata(root), ref: { name: branch, detached: false } },
+              polarity: "positive",
+            };
+          },
+        },
+      }),
+    }),
+    debounceMs: 100,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+  t.after(() => runtime.shutdown(ctx));
+  await runtime.start(ctx);
+
+  const call = bashCall("git switch feature/after-refresh", "after-refresh");
+  runtime.observeToolCall(call, ctx);
+  await runtime.handleCommand("refresh", ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", / · main/u);
+
+  branch = "feature/after-refresh";
+  await runtime.observeToolResult(resultFor(call), ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", / · main/u);
+});
+
+test("errored worktree-add results discover a newly appeared relative destination", async () => {
+  const harness = createHarness();
+  let destinationExists = false;
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      if (
+        destinationExists &&
+        (candidate === "/work/b" || candidate.startsWith("/work/b/"))
+      ) {
+        return discovery("/work/b");
+      }
+      if (candidate === "/work/a" || candidate.startsWith("/work/a/")) {
+        return discovery("/work/a");
+      }
+      return discovery(null);
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      return metadata(root);
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    debounceMs: 5,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness, { cwd: "/work/a" });
+  await runtime.start(ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/a/u);
+
+  const call = bashCall("git worktree add ../b feature/footer", "add-worktree");
+  runtime.observeToolCall(call, ctx);
+  await wait(15);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/a/u);
+
+  destinationExists = true;
+  await runtime.observeToolResult(resultFor(call, true), ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/b/u);
+  runtime.shutdown(ctx);
+});
+
+test("agent_settled performs one conditional coalesced reconciliation", async () => {
+  const harness = createHarness();
+  let branch = "main";
+  let discoveries = 0;
+  let loads = 0;
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      discoveries += 1;
+      return discovery(
+        candidate === "/repo/a" || candidate.startsWith("/repo/a/")
+          ? "/repo/a"
+          : null,
+      );
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      return { ...metadata(root), ref: { name: branch, detached: false } };
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            loads += 1;
+            return {
+              metadata: { ...metadata(root), ref: { name: branch, detached: false } },
+              polarity: "positive",
+            };
+          },
+        },
+      }),
+    }),
+    debounceMs: 50,
+    ageIntervalMs: 5,
+  });
+  const ctx = context(harness);
+  await runtime.start(ctx);
+  const cleanCounts = { discoveries, loads };
+
+  const unsafe = bashCall("git status | cat", "unsafe");
+  runtime.observeToolCall(unsafe, ctx);
+  await runtime.observeToolResult(resultFor(unsafe), ctx);
+  await runtime.observeAgentSettled(ctx);
+  assert.deepEqual({ discoveries, loads }, cleanCounts);
+
+  branch = "feature/settled";
+  const pending = bashCall("git switch feature/settled", "missing-result");
+  runtime.observeToolCall(pending, ctx);
+  await runtime.observeAgentSettled(ctx);
+  assert.equal(discoveries, cleanCounts.discoveries + 1);
+  assert.equal(loads, cleanCounts.loads + 1);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /feature\/settled/u);
+
+  const reconciledCounts = { discoveries, loads };
+  await runtime.observeAgentSettled(ctx);
+  await wait(15);
+  assert.deepEqual({ discoveries, loads }, reconciledCounts);
+  runtime.shutdown(ctx);
+});
+
+test("pinned mode ignores selection hints but refreshes relevant git mutations", async () => {
+  const harness = createHarness();
+  const branches = new Map([
+    ["/repo/a", "main"],
+    ["/repo/b", "other"],
+  ]);
+  let loads = 0;
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      for (const root of branches.keys()) {
+        if (candidate === root || candidate.startsWith(`${root}/`)) return discovery(root);
+      }
+      return discovery(null);
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      return { ...metadata(root), ref: { name: branches.get(root) ?? "main", detached: false } };
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            loads += 1;
+            return {
+              metadata: {
+                ...metadata(root),
+                ref: { name: branches.get(root) ?? "main", detached: false },
+              },
+              polarity: "positive",
+            };
+          },
+        },
+      }),
+    }),
+    debounceMs: 5,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+  await runtime.start(ctx);
+  await runtime.handleCommand("pin /repo/a", ctx);
+  const loadsAfterPin = loads;
+
+  runtime.observeToolCall(readCall("/repo/b/ignored.ts"), ctx);
+  await wait(15);
+  assert.equal(loads, loadsAfterPin);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^📌 acme\/a · main/u);
+
+  const unrelated = bashCall("git -C /repo/b switch elsewhere", "unrelated-pin");
+  runtime.observeToolCall(unrelated, ctx);
+  await runtime.observeToolResult(resultFor(unrelated), ctx);
+  assert.equal(loads, loadsAfterPin);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^📌 acme\/a · main/u);
+
+  branches.set("/repo/a", "feature/pinned");
+  const relevant = bashCall("cd src && git switch feature/pinned", "relevant-pin");
+  runtime.observeToolCall(relevant, ctx);
+  await runtime.observeToolResult(resultFor(relevant), ctx);
+  assert.equal(loads, loadsAfterPin + 1);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^📌 acme\/a · feature\/pinned/u);
+  runtime.shutdown(ctx);
+});
+
+test("newer effect sequence wins when older reconciliation completes last", async () => {
+  const harness = createHarness();
+  let finishOlder: (() => void) | undefined;
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      for (const root of ["/repo/a", "/repo/b", "/repo/c"]) {
+        if (candidate === root || candidate.startsWith(`${root}/`)) return discovery(root);
+      }
+      return discovery(null);
+    },
+    async validateRoot(candidate) {
+      return await this.findRoot(candidate);
+    },
+    async readIdentity(root) {
+      return metadata(root);
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            if (root === "/repo/b") {
+              await new Promise<void>((resolve) => {
+                finishOlder = resolve;
+              });
+            }
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    debounceMs: 100,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+  await runtime.start(ctx);
+
+  const older = bashCall("git -C /repo/b switch older", "older-effect");
+  const newer = bashCall("git -C /repo/c switch newer", "newer-effect");
+  runtime.observeToolCall(older, ctx);
+  runtime.observeToolCall(newer, ctx);
+  const olderResult = runtime.observeToolResult(resultFor(older), ctx);
+  await wait(0);
+  assert.ok(finishOlder);
+
+  await runtime.observeToolResult(resultFor(newer), ctx);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/c/u);
+  const statusCount = harness.statuses.length;
+  finishOlder();
+  await olderResult;
+  assert.equal(harness.statuses.length, statusCount);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/c/u);
+  runtime.shutdown(ctx);
+});
+
+test("shutdown clears staged effects and prevents result or settled work", async () => {
+  const harness = createHarness();
+  let discoveries = 0;
+  let loads = 0;
+  const base = dependencies();
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      discoveries += 1;
+      return await base.repositories.findRoot(candidate);
+    },
+    async validateRoot(candidate) {
+      return await base.repositories.validateRoot(candidate);
+    },
+    async readIdentity(root) {
+      return await base.repositories.readIdentity(root);
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            loads += 1;
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    debounceMs: 100,
+    ageIntervalMs: 60_000,
+  });
+  const ctx = context(harness);
+  await runtime.start(ctx);
+  const call = bashCall("git switch cleanup", "cleanup-effect");
+  runtime.observeToolCall(call, ctx);
+  runtime.shutdown(ctx);
+  const counts = { discoveries, loads };
+
+  await runtime.observeToolResult(resultFor(call), ctx);
+  await runtime.observeAgentSettled(ctx);
+  await wait(0);
+  assert.deepEqual({ discoveries, loads }, counts);
+  assert.equal(harness.statuses.at(-1)?.text, undefined);
 });
 
 test("refresh invalidates metadata while age updates never poll", async () => {
