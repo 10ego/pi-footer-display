@@ -206,6 +206,50 @@ test("factory registration starts no dependencies and restores pinned state", as
   });
 });
 
+test("a new automatic session resolves its cwd instead of the last persisted root", async () => {
+  const harness = createHarness();
+  const observedCandidates: string[] = [];
+  const base = dependencies();
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      observedCandidates.push(candidate);
+      return base.repositories.findRoot(candidate);
+    },
+    async validateRoot(candidate) {
+      return base.repositories.validateRoot(candidate);
+    },
+    async readIdentity(root) {
+      return base.repositories.readIdentity(root);
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    ageIntervalMs: 60_000,
+  });
+  const restored: PersistedFooterState = {
+    version: 1,
+    startedAt: 1_000,
+    mode: "auto",
+    lastConfirmedRoot: "/repo/b",
+  };
+
+  await runtime.start(context(harness, { cwd: "/repo/a", states: [restored] }));
+
+  assert.deepEqual(observedCandidates, ["/repo/a"]);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/a · main/u);
+  runtime.shutdown();
+});
+
 test("persisted pin survives transient startup validation failure with stale display", async () => {
   const harness = createHarness();
   const repositories: RepositoryInspector = {
