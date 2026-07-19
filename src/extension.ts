@@ -267,7 +267,7 @@ export class FooterExtensionRuntime {
       restored.mode === "pinned" && restored.pinnedRoot
         ? validateRestored(restored.pinnedRoot)
         : undefined,
-      restored.lastConfirmedRoot
+      restored.mode === "pinned" && restored.lastConfirmedRoot
         ? validateRestored(restored.lastConfirmedRoot)
         : undefined,
     ]);
@@ -298,7 +298,6 @@ export class FooterExtensionRuntime {
       this.#lastConfirmedRoot = undefined;
     }
 
-    selectedRoot ??= this.#lastConfirmedRoot;
     const hints = selectedRoot
       ? [{ path: selectedRoot, source: "file" as const }]
       : [fallbackPath(this.#startupCwd)];

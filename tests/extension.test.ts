@@ -299,7 +299,7 @@ test("persisted pin survives transient startup validation failure with stale dis
   runtime.shutdown(ctx);
 });
 
-test("confirmed non-repository restored pin downgrades to validated fallback", async () => {
+test("confirmed non-repository restored pin downgrades to the session cwd", async () => {
   const harness = createHarness();
   const runtime = registerFooterDisplay(harness.pi, {
     createDependencies: dependencies,
@@ -316,14 +316,14 @@ test("confirmed non-repository restored pin downgrades to validated fallback", a
   const ctx = context(harness, { cwd: "/repo/a", states: [restored] });
   await runtime.start(ctx);
 
-  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/c · main/u);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/a · main/u);
   assert.deepEqual(harness.appended.at(-1), {
     type: FOOTER_STATE_ENTRY,
     data: {
       version: 1,
       startedAt: 1_000,
       mode: "auto",
-      lastConfirmedRoot: "/repo/c",
+      lastConfirmedRoot: "/repo/a",
     },
   });
 
