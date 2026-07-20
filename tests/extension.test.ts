@@ -250,6 +250,52 @@ test("a new automatic session resolves its cwd instead of the last persisted roo
   runtime.shutdown();
 });
 
+test("automatic startup outside a repository does not restore the old root on refresh", async () => {
+  const harness = createHarness();
+  const observedCandidates: string[] = [];
+  const base = dependencies();
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      observedCandidates.push(candidate);
+      return base.repositories.findRoot(candidate);
+    },
+    async validateRoot(candidate) {
+      return base.repositories.validateRoot(candidate);
+    },
+    async readIdentity(root) {
+      return base.repositories.readIdentity(root);
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    ageIntervalMs: 60_000,
+  });
+  const restored: PersistedFooterState = {
+    version: 1,
+    startedAt: 1_000,
+    mode: "auto",
+    lastConfirmedRoot: "/repo/b",
+  };
+  const ctx = context(harness, { cwd: "/outside", states: [restored] });
+
+  await runtime.start(ctx);
+  await runtime.handleCommand("refresh", ctx);
+
+  assert.deepEqual(observedCandidates, ["/outside", "/outside"]);
+  assert.doesNotMatch(harness.statuses.at(-1)?.text ?? "", /acme\/b/u);
+  runtime.shutdown();
+});
+
 test("persisted pin survives transient startup validation failure with stale display", async () => {
   const harness = createHarness();
   const repositories: RepositoryInspector = {
