@@ -90,7 +90,7 @@ Consequences:
 - time while Pi is closed is included—it is not active-work duration;
 - a system clock earlier than `startedAt` displays `0s` rather than a negative age.
 
-Restored roots are revalidated and canonicalized with structured results. A confirmed deleted or non-repository pin may downgrade to automatic mode and fall back to a valid last-confirmed root, then the startup directory. An indeterminate failure—missing or timed-out Git, permission or realpath failure, or another process error—preserves `mode=pinned`, `pinnedRoot`, `lastConfirmedRoot`, and `startedAt`, publishes stale/unavailable status, and does not persist an automatic-mode downgrade.
+Restored pins are revalidated and canonicalized with structured results. Automatic session startup always resolves the session working directory rather than selecting a persisted last-confirmed root. A confirmed deleted or non-repository pin downgrades to automatic mode and resolves the startup directory. An indeterminate failure—missing or timed-out Git, permission or realpath failure, or another process error—preserves `mode=pinned`, `pinnedRoot`, `lastConfirmedRoot`, and `startedAt`, publishes stale/unavailable status, and does not persist an automatic-mode downgrade.
 
 ### `/new` and the session working directory
 

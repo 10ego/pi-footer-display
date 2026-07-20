@@ -206,6 +206,99 @@ test("factory registration starts no dependencies and restores pinned state", as
   });
 });
 
+test("a new automatic session resolves its cwd instead of the last persisted root", async () => {
+  const harness = createHarness();
+  const observedCandidates: string[] = [];
+  const base = dependencies();
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      observedCandidates.push(candidate);
+      return base.repositories.findRoot(candidate);
+    },
+    async validateRoot(candidate) {
+      return base.repositories.validateRoot(candidate);
+    },
+    async readIdentity(root) {
+      return base.repositories.readIdentity(root);
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    ageIntervalMs: 60_000,
+  });
+  const restored: PersistedFooterState = {
+    version: 1,
+    startedAt: 1_000,
+    mode: "auto",
+    lastConfirmedRoot: "/repo/b",
+  };
+
+  await runtime.start(context(harness, { cwd: "/repo/a", states: [restored] }));
+
+  assert.deepEqual(observedCandidates, ["/repo/a"]);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/a · main/u);
+  runtime.shutdown();
+});
+
+test("automatic startup outside a repository does not restore the old root on refresh", async () => {
+  const harness = createHarness();
+  const observedCandidates: string[] = [];
+  const base = dependencies();
+  const repositories: RepositoryInspector = {
+    async findRoot(candidate) {
+      observedCandidates.push(candidate);
+      return base.repositories.findRoot(candidate);
+    },
+    async validateRoot(candidate) {
+      return base.repositories.validateRoot(candidate);
+    },
+    async readIdentity(root) {
+      return base.repositories.readIdentity(root);
+    },
+  };
+  const runtime = registerFooterDisplay(harness.pi, {
+    createDependencies: () => ({
+      repositories,
+      core: new ContextCore({
+        repositories,
+        metadata: {
+          async load(root) {
+            return { metadata: metadata(root), polarity: "positive" };
+          },
+        },
+      }),
+    }),
+    ageIntervalMs: 60_000,
+  });
+  const restored: PersistedFooterState = {
+    version: 1,
+    startedAt: 1_000,
+    mode: "auto",
+    lastConfirmedRoot: "/repo/b",
+  };
+  const ctx = context(harness, { cwd: "/outside", states: [restored] });
+
+  await runtime.start(ctx);
+  await runtime.handleCommand("refresh", ctx);
+  runtime.shutdown();
+
+  assert.deepEqual(observedCandidates, ["/outside"]);
+  assert.doesNotMatch(
+    harness.statuses.at(-2)?.text ?? "",
+    /acme\/b/u,
+  );
+});
+
 test("persisted pin survives transient startup validation failure with stale display", async () => {
   const harness = createHarness();
   const repositories: RepositoryInspector = {
@@ -255,7 +348,7 @@ test("persisted pin survives transient startup validation failure with stale dis
   runtime.shutdown(ctx);
 });
 
-test("confirmed non-repository restored pin downgrades to validated fallback", async () => {
+test("confirmed non-repository restored pin downgrades to the session cwd", async () => {
   const harness = createHarness();
   const runtime = registerFooterDisplay(harness.pi, {
     createDependencies: dependencies,
@@ -272,14 +365,14 @@ test("confirmed non-repository restored pin downgrades to validated fallback", a
   const ctx = context(harness, { cwd: "/repo/a", states: [restored] });
   await runtime.start(ctx);
 
-  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/c · main/u);
+  assert.match(harness.statuses.at(-1)?.text ?? "", /^acme\/a · main/u);
   assert.deepEqual(harness.appended.at(-1), {
     type: FOOTER_STATE_ENTRY,
     data: {
       version: 1,
       startedAt: 1_000,
       mode: "auto",
-      lastConfirmedRoot: "/repo/c",
+      lastConfirmedRoot: "/repo/a",
     },
   });
 

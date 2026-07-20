@@ -232,7 +232,8 @@ export class FooterExtensionRuntime {
     const restored = restoration.state;
     this.#lastPersisted = restoration.fromEntry ? restored : undefined;
     this.#controller = new FooterSessionController(restored.startedAt);
-    this.#lastConfirmedRoot = restored.lastConfirmedRoot;
+    this.#lastConfirmedRoot =
+      restored.mode === "pinned" ? restored.lastConfirmedRoot : undefined;
     if (restored.mode === "pinned" && restored.pinnedRoot) {
       this.#controller.pin(restored.pinnedRoot);
     }
@@ -267,7 +268,7 @@ export class FooterExtensionRuntime {
       restored.mode === "pinned" && restored.pinnedRoot
         ? validateRestored(restored.pinnedRoot)
         : undefined,
-      restored.lastConfirmedRoot
+      restored.mode === "pinned" && restored.lastConfirmedRoot
         ? validateRestored(restored.lastConfirmedRoot)
         : undefined,
     ]);
@@ -298,7 +299,6 @@ export class FooterExtensionRuntime {
       this.#lastConfirmedRoot = undefined;
     }
 
-    selectedRoot ??= this.#lastConfirmedRoot;
     const hints = selectedRoot
       ? [{ path: selectedRoot, source: "file" as const }]
       : [fallbackPath(this.#startupCwd)];
