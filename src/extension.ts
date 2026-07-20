@@ -232,7 +232,8 @@ export class FooterExtensionRuntime {
     const restored = restoration.state;
     this.#lastPersisted = restoration.fromEntry ? restored : undefined;
     this.#controller = new FooterSessionController(restored.startedAt);
-    this.#lastConfirmedRoot = restored.lastConfirmedRoot;
+    this.#lastConfirmedRoot =
+      restored.mode === "pinned" ? restored.lastConfirmedRoot : undefined;
     if (restored.mode === "pinned" && restored.pinnedRoot) {
       this.#controller.pin(restored.pinnedRoot);
     }

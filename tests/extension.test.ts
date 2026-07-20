@@ -290,10 +290,13 @@ test("automatic startup outside a repository does not restore the old root on re
 
   await runtime.start(ctx);
   await runtime.handleCommand("refresh", ctx);
-
-  assert.deepEqual(observedCandidates, ["/outside", "/outside"]);
-  assert.doesNotMatch(harness.statuses.at(-1)?.text ?? "", /acme\/b/u);
   runtime.shutdown();
+
+  assert.deepEqual(observedCandidates, ["/outside"]);
+  assert.doesNotMatch(
+    harness.statuses.at(-2)?.text ?? "",
+    /acme\/b/u,
+  );
 });
 
 test("persisted pin survives transient startup validation failure with stale display", async () => {
